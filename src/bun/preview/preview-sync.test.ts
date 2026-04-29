@@ -10,8 +10,8 @@
  *   - Finding 7: pending / firstSignalAt の reset は fire() に集約
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -27,7 +27,7 @@ interface TestEnv {
   cwd: string;
   slidesDir: string;
   slidesEntry: string;
-  emitChatEvent: (e: ChatEvent) => void;
+  /** start() の subscribe() unsub が呼ばれたかを観測するフラグ */
   unsubscribed: { value: boolean };
   cleanup: () => Promise<void>;
 }
@@ -46,28 +46,13 @@ async function setupTestEnv(): Promise<TestEnv> {
   await writeFile(slidesEntry, "<html><body>v0</body></html>", "utf8");
   await new Promise((r) => setTimeout(r, 60));
 
-  const handlers = new Set<(e: ChatEvent) => void>();
-  const unsubscribed = { value: false };
-
-  const emitChatEvent = (e: ChatEvent) => {
-    for (const h of handlers) h(e);
-  };
-
-  const cleanup = async () => {
-    await rm(cwd, { recursive: true, force: true });
-  };
-
-  // PreviewSync.start({ subscribeChatEvents }) に渡す関数を返すには env を返した側で組む
   return {
     cwd,
     slidesDir,
     slidesEntry,
-    emitChatEvent,
-    unsubscribed,
-    cleanup,
+    unsubscribed: { value: false },
+    cleanup: () => rm(cwd, { recursive: true, force: true }),
   };
-
-  // subscribeChatEvents は subscribe(handler) を保存しておく
 }
 
 function makeSubscribe(env: TestEnv) {
