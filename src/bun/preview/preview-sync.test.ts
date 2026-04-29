@@ -448,11 +448,61 @@ describe("PreviewSync chokidar trigger (real fs)", () => {
 
   test("multiple writes within debounce are coalesced into 1 reload", async () => {
     await writeFile(env.slidesEntry, "<html><body>v1</body></html>", "utf8");
-    await waitMs(5);
     await writeFile(env.slidesEntry, "<html><body>v2</body></html>", "utf8");
-    await waitMs(5);
     await writeFile(env.slidesEntry, "<html><body>v3</body></html>", "utf8");
+    // 連続 write は awaitWriteFinish + debounce で 1 回に畳まれる
+    await waitMs(300);
+    expect(updates.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cycle 5: 重複排除（両経路同時）
+// ---------------------------------------------------------------------------
+
+describe("PreviewSync dedup (SSE + chokidar in same window)", () => {
+  let env: TestEnv;
+  let sync: PreviewSync;
+  let sub: ReturnType<typeof makeSubscribe>;
+  let updates: PreviewUpdateInfo[];
+
+  beforeEach(async () => {
+    env = await setupTestEnv();
+    // window を 100ms に広げて両経路を同窓に入れる
+    sync = new PreviewSync({ debounceMs: 100, silent: true });
+    sub = makeSubscribe(env);
+    updates = [];
+    sync.onUpdate((info) => updates.push(info));
+    await sync.start({
+      projectId: "p1",
+      cwd: env.cwd,
+      slidesEntry: env.slidesEntry,
+      subscribeChatEvents: sub.subscribe,
+    });
+  });
+
+  afterEach(async () => {
+    await sync.stop();
+    await env.cleanup();
+  });
+
+  test("SSE + chokidar within window → 1 reload, source='both', counters.both=1", async () => {
+    // chokidar 起動: write して change を発生させる
+    await writeFile(env.slidesEntry, "<html><body>v1</body></html>", "utf8");
+    // SSE を即座に流す
+    sub.emit(
+      makeToolStatus({
+        tool: "edit",
+        status: "completed",
+        filePath: env.slidesEntry,
+      }),
+    );
+    // awaitWriteFinish 30 + debounce 100 + α
     await waitMs(250);
     expect(updates.length).toBe(1);
+    expect(updates[0]!.source).toBe("both");
+    expect(sync.getCounters().both).toBe(1);
+    expect(sync.getCounters().sseOnly).toBe(0);
+    expect(sync.getCounters().chokidarOnly).toBe(0);
   });
 });
