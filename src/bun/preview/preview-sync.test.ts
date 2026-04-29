@@ -40,8 +40,11 @@ async function setupTestEnv(): Promise<TestEnv> {
   const slidesDir = join(cwd, "slides");
   await mkdir(slidesDir, { recursive: true });
   const slidesEntry = join(slidesDir, "index.html");
-  // 初期 HTML を 1 つ置く (ignoreInitial: true で発火されないこと前提)
+  // 初期 HTML を 1 つ置く (ignoreInitial: true で発火されないこと前提).
+  // chokidar の awaitWriteFinish がまだ "stabilizing" と判断しないよう,
+  // start() より十分先に書き込み, 少し待ってからチェッカを始める.
   await writeFile(slidesEntry, "<html><body>v0</body></html>", "utf8");
+  await new Promise((r) => setTimeout(r, 60));
 
   const handlers = new Set<(e: ChatEvent) => void>();
   const unsubscribed = { value: false };
@@ -202,5 +205,175 @@ describe("PreviewSync lifecycle", () => {
     expect(env.unsubscribed.value).toBe(false);
     await sync.stop();
     expect(env.unsubscribed.value).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cycle 3: SSE 経路の発火
+// ---------------------------------------------------------------------------
+
+describe("PreviewSync SSE trigger", () => {
+  let env: TestEnv;
+  let sync: PreviewSync;
+  let sub: ReturnType<typeof makeSubscribe>;
+  let updates: PreviewUpdateInfo[];
+
+  beforeEach(async () => {
+    env = await setupTestEnv();
+    sync = new PreviewSync({ debounceMs: 30, silent: true });
+    sub = makeSubscribe(env);
+    updates = [];
+    sync.onUpdate((info) => updates.push(info));
+    await sync.start({
+      projectId: "p1",
+      cwd: env.cwd,
+      slidesEntry: env.slidesEntry,
+      subscribeChatEvents: sub.subscribe,
+    });
+  });
+
+  afterEach(async () => {
+    await sync.stop();
+    await env.cleanup();
+  });
+
+  test("tool-status (edit, completed, slidesEntry) fires onUpdate", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "edit",
+        status: "completed",
+        filePath: env.slidesEntry,
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(1);
+    expect(updates[0]!.source).toBe("sse");
+    const expected = pathToFileURL(env.slidesEntry).href;
+    expect(updates[0]!.url.startsWith(expected)).toBe(true);
+    expect(updates[0]!.url).toMatch(/\?t=\d+/);
+    expect(sync.getCounters().sseOnly).toBe(1);
+  });
+
+  test("write tool also fires", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "write",
+        status: "completed",
+        filePath: env.slidesEntry,
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(1);
+    expect(updates[0]!.source).toBe("sse");
+  });
+
+  test("multiedit / patch are also accepted (Finding 3)", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "multiedit",
+        status: "completed",
+        filePath: env.slidesEntry,
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(1);
+    updates.length = 0;
+
+    sub.emit(
+      makeToolStatus({
+        tool: "patch",
+        status: "completed",
+        filePath: env.slidesEntry,
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(1);
+  });
+
+  test("status='running' is ignored", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "edit",
+        status: "running",
+        filePath: env.slidesEntry,
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(0);
+  });
+
+  test("non-edit tools are ignored (e.g. read)", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "read",
+        status: "completed",
+        filePath: env.slidesEntry,
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(0);
+  });
+
+  test("different path is ignored", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "edit",
+        status: "completed",
+        filePath: `${env.slidesDir}/other.html`,
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(0);
+  });
+
+  test("falls back to file_path / file / path keys", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "edit",
+        status: "completed",
+        filePath: env.slidesEntry,
+        inputKey: "file_path",
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(1);
+    updates.length = 0;
+
+    sub.emit(
+      makeToolStatus({
+        tool: "edit",
+        status: "completed",
+        filePath: env.slidesEntry,
+        inputKey: "file",
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(1);
+  });
+
+  test("debounce coalesces multiple SSE signals into 1 reload", async () => {
+    for (let i = 0; i < 5; i++) {
+      sub.emit(
+        makeToolStatus({
+          tool: "edit",
+          status: "completed",
+          filePath: env.slidesEntry,
+        }),
+      );
+    }
+    await waitMs(80);
+    expect(updates.length).toBe(1);
+  });
+
+  test("relative path in input is resolved against cwd", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "edit",
+        status: "completed",
+        filePath: "slides/index.html",
+      }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(1);
   });
 });
