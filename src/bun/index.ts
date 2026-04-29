@@ -43,6 +43,7 @@ import { ChatBridge } from "./opencode/chat-bridge";
 import type { ChatEvent } from "./opencode/types";
 import { OpencodeServerManager } from "./opencode/server-manager";
 import type { OpencodeServerInfo } from "./opencode/server-manager";
+import { PreviewSync } from "./preview/preview-sync";
 
 const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ready") }),
@@ -190,6 +191,31 @@ async function refineSlides(
   }
 }
 
+async function setupPreviewSync(
+  win: BrowserWindow,
+  project: Project,
+  bridge: ChatBridge,
+  sessionId: string | null,
+): Promise<PreviewSync> {
+  const debounceRaw = process.env.PREVIEW_SYNC_DEBOUNCE_MS;
+  const debounceMs =
+    debounceRaw !== undefined && /^\d+$/.test(debounceRaw)
+      ? Number(debounceRaw)
+      : undefined;
+  const sync = new PreviewSync(debounceMs !== undefined ? { debounceMs } : {});
+  sync.onUpdate(({ url }) => {
+    sendToWebView(win, { type: "open-slides", url });
+  });
+  await sync.start({
+    projectId: project.meta.id,
+    cwd: project.cwd,
+    slidesEntry: project.slidesEntry,
+    subscribeChatEvents: (handler) => bridge.onEvent(handler),
+    ...(sessionId !== null ? { sessionId } : {}),
+  });
+  return sync;
+}
+
 interface ApiKeyHandlers {
   onSubmitApiKey: (key: string) => void | Promise<void>;
   onResetApiKey: () => void | Promise<void>;
@@ -258,6 +284,7 @@ async function bootstrap(): Promise<void> {
   let activeManager: OpencodeServerManager | null = null;
   let activeBridge: ChatBridge | null = null;
   let activeSession: { sessionId: string } | null = null;
+  let activePreviewSync: PreviewSync | null = null;
   const keychain = new KeychainAdapter();
 
   const win = new BrowserWindow({
@@ -286,6 +313,14 @@ async function bootstrap(): Promise<void> {
    * 既存の ChatBridge / Manager を停止する。再起動 (再入力 / 失敗ロールバック) で利用。
    */
   async function shutdownActiveServer(): Promise<void> {
+    if (activePreviewSync) {
+      try {
+        await activePreviewSync.stop();
+      } catch (err) {
+        console.warn("[slAIdo] previous preview-sync stop failed:", err);
+      }
+      activePreviewSync = null;
+    }
     if (activeBridge) {
       try {
         await activeBridge.dispose();
@@ -424,6 +459,23 @@ async function bootstrap(): Promise<void> {
       }
     }
 
+    // T012 PreviewSync: SSE tool-status + chokidar の二経路で iframe 再ロードを駆動.
+    // 初期 reload は dom-ready ハンドラ / startManagerWithKey 成功後の open-slides に任せる
+    // ため PreviewSync は変化時のみ専任 (plan §4.3).
+    if (activeProject && activeBridge) {
+      try {
+        activePreviewSync = await setupPreviewSync(
+          win,
+          activeProject,
+          activeBridge,
+          activeSession?.sessionId ?? null,
+        );
+      } catch (err) {
+        console.error("[slAIdo] PreviewSync start failed:", err);
+        activePreviewSync = null;
+      }
+    }
+
     if (runValidation) {
       sendToWebView(win, { type: "api-key-validated" });
     } else {
@@ -530,7 +582,9 @@ async function bootstrap(): Promise<void> {
 
   // before-quit は同期 emit (Node EventEmitter) で async は待たれない。
   // SIGTERM は async 関数の同期部分で送られるため、await せずに stop() を呼ぶ。
+  // PreviewSync は SSE 購読を先に切ってから ChatBridge を dispose する順序を守る.
   Electrobun.events.on("before-quit", () => {
+    void activePreviewSync?.stop();
     void activeBridge?.dispose();
     void activeManager?.stop();
   });
