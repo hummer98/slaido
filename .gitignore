@@ -3,3 +3,7 @@ build/
 dist/
 *.local
 .env
+
+# fixture / template dist は追跡する
+!tests/fixtures/reveal-template/dist/
+!assets/templates/reveal/dist/
