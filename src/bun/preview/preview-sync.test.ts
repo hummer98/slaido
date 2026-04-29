@@ -599,3 +599,129 @@ describe("PreviewSync structured logging", () => {
     expect(stopLog).toContain('"sseOnly":0');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Finding 2: SSE 切断時の動作
+// ---------------------------------------------------------------------------
+
+describe("PreviewSync sse-closed handling (Finding 2)", () => {
+  let env: TestEnv;
+  let sync: PreviewSync;
+  let sub: ReturnType<typeof makeSubscribe>;
+  let updates: PreviewUpdateInfo[];
+  let originalLog: typeof console.log;
+  let logs: string[];
+
+  beforeEach(async () => {
+    env = await setupTestEnv();
+    sync = new PreviewSync({ debounceMs: 30, silent: false });
+    sub = makeSubscribe(env);
+    updates = [];
+    sync.onUpdate((info) => updates.push(info));
+    originalLog = console.log;
+    logs = [];
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+    };
+    await sync.start({
+      projectId: "p1",
+      cwd: env.cwd,
+      slidesEntry: env.slidesEntry,
+      subscribeChatEvents: sub.subscribe,
+    });
+  });
+
+  afterEach(async () => {
+    await sync.stop();
+    console.log = originalLog;
+    await env.cleanup();
+  });
+
+  test("error/sse-closed で 1 行ログ + 以後の SSE は無視される", async () => {
+    sub.emit({ type: "error", reason: "sse-closed" });
+    expect(logs.some((l) => l.includes("[preview-sync] sse-closed"))).toBe(true);
+
+    // ログ重複しないこと
+    sub.emit({ type: "error", reason: "sse-closed" });
+    const occurrences = logs.filter((l) =>
+      l.includes("[preview-sync] sse-closed; running on chokidar only"),
+    ).length;
+    expect(occurrences).toBe(1);
+
+    // 切断後の tool-status は無視される
+    sub.emit(
+      makeToolStatus({ tool: "edit", status: "completed", filePath: env.slidesEntry }),
+    );
+    await waitMs(80);
+    expect(updates.length).toBe(0);
+  });
+
+  test("error/sse-closed 後も chokidar 経路は機能し続ける", async () => {
+    sub.emit({ type: "error", reason: "sse-closed" });
+    await writeFile(env.slidesEntry, "<html><body>v1</body></html>", "utf8");
+    await waitMs(200);
+    expect(updates.length).toBe(1);
+    expect(updates[0]!.source).toBe("chokidar");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7: invalid HTML 時の skip
+// ---------------------------------------------------------------------------
+
+describe("PreviewSync invalid HTML skip (R7)", () => {
+  let env: TestEnv;
+  let sync: PreviewSync;
+  let sub: ReturnType<typeof makeSubscribe>;
+  let updates: PreviewUpdateInfo[];
+
+  beforeEach(async () => {
+    env = await setupTestEnv();
+    sync = new PreviewSync({ debounceMs: 30, silent: true });
+    sub = makeSubscribe(env);
+    updates = [];
+    sync.onUpdate((info) => updates.push(info));
+    await sync.start({
+      projectId: "p1",
+      cwd: env.cwd,
+      slidesEntry: env.slidesEntry,
+      subscribeChatEvents: sub.subscribe,
+    });
+  });
+
+  afterEach(async () => {
+    await sync.stop();
+    await env.cleanup();
+  });
+
+  test("空ファイルへの編集は onUpdate を発火しない", async () => {
+    await writeFile(env.slidesEntry, "", "utf8");
+    sub.emit(
+      makeToolStatus({ tool: "edit", status: "completed", filePath: env.slidesEntry }),
+    );
+    await waitMs(200);
+    expect(updates.length).toBe(0);
+  });
+
+  test("HTML らしくないテキストへの編集は発火しない", async () => {
+    await writeFile(env.slidesEntry, "no tags at all", "utf8");
+    sub.emit(
+      makeToolStatus({ tool: "edit", status: "completed", filePath: env.slidesEntry }),
+    );
+    await waitMs(200);
+    expect(updates.length).toBe(0);
+  });
+
+  test("<!doctype html> から始まるなら有効と扱う", async () => {
+    await writeFile(
+      env.slidesEntry,
+      "<!doctype html>\n<head></head>",
+      "utf8",
+    );
+    sub.emit(
+      makeToolStatus({ tool: "edit", status: "completed", filePath: env.slidesEntry }),
+    );
+    await waitMs(200);
+    expect(updates.length).toBeGreaterThan(0);
+  });
+});
