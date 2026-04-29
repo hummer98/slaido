@@ -6,6 +6,7 @@ dist/
 
 # fixture / template dist は追跡する
 !tests/fixtures/reveal-template/dist/
+!tests/fixtures/reveal-mini/dist/
 !assets/templates/reveal/dist/
 
 /bin/
