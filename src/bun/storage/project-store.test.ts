@@ -103,9 +103,7 @@ describe("ProjectStore.create", () => {
     }
   });
 
-  it("create 中の write 失敗時は best-effort で半端ディレクトリをクリーンアップ", async () => {
-    // 不正な templateRoot（index.html だけある不完全テンプレ）でテンプレ検証は通さず、
-    // create 中に TEMPLATE_MISSING を投げさせて、残骸が残らないことを確認する。
+  it("不完全テンプレでも write 失敗時に半端ディレクトリは残らない", async () => {
     const incompleteTpl = join(workdir, "incomplete-template");
     await mkdir(incompleteTpl, { recursive: true });
     await writeFile(join(incompleteTpl, "index.html"), "ok");
@@ -123,5 +121,65 @@ describe("ProjectStore.create", () => {
       const remaining = await readdir(projectsRoot);
       expect(remaining).toEqual([]);
     }
+  });
+});
+
+describe("ProjectStore.load", () => {
+  it("create で書いた meta を読み戻せる", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    const created = await store.create({ title: "Saved", seedText: "seed-x" });
+
+    const loaded = await store.load(created.meta.id);
+    expect(loaded.meta.id).toBe(created.meta.id);
+    expect(loaded.meta.title).toBe("Saved");
+    expect(loaded.meta.schemaVersion).toBe(1);
+    expect(loaded.cwd).toBe(created.cwd);
+    expect(loaded.slidesEntry).toBe(created.slidesEntry);
+  });
+
+  it("未知 ID は PROJECT_NOT_FOUND", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    let caught: unknown;
+    try {
+      await store.load("00000000-0000-4000-8000-000000000000");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProjectStoreError);
+    expect((caught as ProjectStoreError).code).toBe("PROJECT_NOT_FOUND");
+  });
+
+  it("meta.json が JSON 不正 → META_CORRUPTED", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    const project = await store.create({ title: "broken", seedText: "" });
+    await writeFile(join(project.cwd, "meta.json"), "{ not json", "utf8");
+
+    let caught: unknown;
+    try {
+      await store.load(project.meta.id);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProjectStoreError);
+    expect((caught as ProjectStoreError).code).toBe("META_CORRUPTED");
+  });
+
+  it("schemaVersion が 1 以外 → META_CORRUPTED", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    const project = await store.create({ title: "future", seedText: "" });
+    await writeFile(
+      join(project.cwd, "meta.json"),
+      JSON.stringify({ ...project.meta, schemaVersion: 2 }),
+      "utf8",
+    );
+
+    let caught: unknown;
+    try {
+      await store.load(project.meta.id);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProjectStoreError);
+    expect((caught as ProjectStoreError).code).toBe("META_CORRUPTED");
   });
 });

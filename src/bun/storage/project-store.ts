@@ -1,7 +1,8 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { copyRevealTemplate } from "./template-copier";
 import {
+  ProjectMetaSchema,
   ProjectStoreError,
   type CreateProjectInput,
   type Project,
@@ -17,6 +18,10 @@ function buildInitialMeta(id: string, title: string, now: string): ProjectMeta {
     updatedAt: now,
     schemaVersion: 1,
   };
+}
+
+function isErrnoException(e: unknown): e is NodeJS.ErrnoException {
+  return e instanceof Error && typeof (e as NodeJS.ErrnoException).code === "string";
 }
 
 export class ProjectStore {
@@ -57,22 +62,67 @@ export class ProjectStore {
 
       console.log(`[slAIdo:store] created project ${meta.id} title="${meta.title}"`);
 
-      return {
-        meta,
-        cwd,
-        slidesEntry: join(cwd, "slides", "index.html"),
-      };
+      return this.toProject(meta);
     } catch (err) {
       await this.bestEffortRm(cwd);
       if (err instanceof ProjectStoreError) throw err;
-      const code = (err as NodeJS.ErrnoException)?.code;
-      if (code === "EEXIST") {
+      if (isErrnoException(err) && err.code === "EEXIST") {
         throw new ProjectStoreError("PROJECT_ALREADY_EXISTS", `id collision: ${id}`, { cause: err });
       }
-      throw new ProjectStoreError("IO_ERROR", `create failed: ${(err as Error)?.message ?? String(err)}`, {
-        cause: err,
-      });
+      throw new ProjectStoreError(
+        "IO_ERROR",
+        `create failed: ${(err as Error)?.message ?? String(err)}`,
+        { cause: err },
+      );
     }
+  }
+
+  async load(projectId: ProjectId): Promise<Project> {
+    const cwd = this.getCwd(projectId);
+    const metaPath = join(cwd, "meta.json");
+
+    let raw: string;
+    try {
+      raw = await readFile(metaPath, "utf8");
+    } catch (err) {
+      if (isErrnoException(err) && err.code === "ENOENT") {
+        throw new ProjectStoreError("PROJECT_NOT_FOUND", `project not found: ${projectId}`, { cause: err });
+      }
+      throw new ProjectStoreError(
+        "IO_ERROR",
+        `load failed: ${(err as Error)?.message ?? String(err)}`,
+        { cause: err },
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new ProjectStoreError("META_CORRUPTED", `invalid meta.json JSON: ${projectId}`, { cause: err });
+    }
+
+    const result = ProjectMetaSchema.safeParse(parsed);
+    if (!result.success) {
+      throw new ProjectStoreError(
+        "META_CORRUPTED",
+        `meta.json schema mismatch: ${projectId}`,
+        { cause: result.error },
+      );
+    }
+
+    console.log(`[slAIdo:store] loaded project ${result.data.id} title="${result.data.title}"`);
+
+    return this.toProject(result.data);
+  }
+
+  private toProject(meta: ProjectMeta): Project {
+    const cwd = this.getCwd(meta.id);
+    return {
+      meta,
+      cwd,
+      slidesEntry: join(cwd, "slides", "index.html"),
+    };
   }
 
   private async bestEffortRm(target: string): Promise<void> {
