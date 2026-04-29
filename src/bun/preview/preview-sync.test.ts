@@ -486,6 +486,27 @@ describe("PreviewSync dedup (SSE + chokidar in same window)", () => {
     await env.cleanup();
   });
 
+  test("debounce デバウンス挙動: trailing 100ms 静止後に 1 回だけ発火 (Finding 3 / R3)", async () => {
+    // 50ms 間隔で 3 回 SSE → 静止 → window 100ms 経過後に 1 回発火
+    sub.emit(
+      makeToolStatus({ tool: "edit", status: "completed", filePath: env.slidesEntry }),
+    );
+    await waitMs(40);
+    sub.emit(
+      makeToolStatus({ tool: "edit", status: "completed", filePath: env.slidesEntry }),
+    );
+    await waitMs(40);
+    sub.emit(
+      makeToolStatus({ tool: "edit", status: "completed", filePath: env.slidesEntry }),
+    );
+    // この時点で最初の signal から 80ms. まだ window 内.
+    await waitMs(50);
+    expect(updates.length).toBe(0);
+    // 最後の signal から 100ms+α 経つと発火する想定.
+    await waitMs(100);
+    expect(updates.length).toBe(1);
+  });
+
   test("SSE + chokidar within window → 1 reload, source='both', counters.both=1", async () => {
     // chokidar 起動: write して change を発生させる
     await writeFile(env.slidesEntry, "<html><body>v1</body></html>", "utf8");
@@ -504,5 +525,77 @@ describe("PreviewSync dedup (SSE + chokidar in same window)", () => {
     expect(sync.getCounters().both).toBe(1);
     expect(sync.getCounters().sseOnly).toBe(0);
     expect(sync.getCounters().chokidarOnly).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cycle 6: 計測ログ
+// ---------------------------------------------------------------------------
+
+describe("PreviewSync structured logging", () => {
+  let env: TestEnv;
+  let sync: PreviewSync;
+  let sub: ReturnType<typeof makeSubscribe>;
+  let updates: PreviewUpdateInfo[];
+  let originalLog: typeof console.log;
+  let logs: string[];
+
+  beforeEach(async () => {
+    env = await setupTestEnv();
+    // silent: false で実ログを取りに行く
+    sync = new PreviewSync({ debounceMs: 30, silent: false });
+    sub = makeSubscribe(env);
+    updates = [];
+    sync.onUpdate((info) => updates.push(info));
+    originalLog = console.log;
+    logs = [];
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+    };
+    await sync.start({
+      projectId: "p1",
+      cwd: env.cwd,
+      slidesEntry: env.slidesEntry,
+      subscribeChatEvents: sub.subscribe,
+      sessionId: "s-test",
+    });
+  });
+
+  afterEach(async () => {
+    await sync.stop();
+    console.log = originalLog;
+    await env.cleanup();
+  });
+
+  test("[preview-sync] reload は JSON ペイロードに source / counters を含む", async () => {
+    sub.emit(
+      makeToolStatus({
+        tool: "edit",
+        status: "completed",
+        filePath: env.slidesEntry,
+      }),
+    );
+    await waitMs(80);
+    const reloadLog = logs.find((l) => l.startsWith("[preview-sync] reload {"));
+    expect(reloadLog).toBeDefined();
+    const json = JSON.parse(reloadLog!.replace(/^\[preview-sync\] reload /, ""));
+    expect(json.source).toBe("sse");
+    expect(json.projectId).toBe("p1");
+    expect(json.sessionId).toBe("s-test");
+    expect(typeof json.totalSinceFirstSignalMs).toBe("number");
+    expect(json.counters).toEqual({ sseOnly: 1, chokidarOnly: 0, both: 0 });
+  });
+
+  test("[preview-sync] start ログを起動時に 1 行", () => {
+    const startLog = logs.find((l) => l.startsWith("[preview-sync] start"));
+    expect(startLog).toBeDefined();
+    expect(startLog).toContain("projectId=p1");
+  });
+
+  test("[preview-sync] stop counters=... を停止時に 1 行", async () => {
+    await sync.stop();
+    const stopLog = logs.find((l) => l.startsWith("[preview-sync] stop counters="));
+    expect(stopLog).toBeDefined();
+    expect(stopLog).toContain('"sseOnly":0');
   });
 });

@@ -364,13 +364,14 @@ export class PreviewSync {
   // -------------------------------------------------------------------------
 
   private schedule(source: "sse" | "chokidar"): void {
+    // trailing デバウンス: 最後の合図から debounceMs 静止して発火 (plan §2.2).
     const now = this.now();
     if (this.pendingSources === null) this.pendingSources = new Set();
     this.pendingSources.add(source);
     if (this.firstSignalAt === null) this.firstSignalAt = now;
     if (source === "sse") this.lastSseAt = now;
     if (source === "chokidar") this.lastFsAt = now;
-    if (this.debounceTimer) return;
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => this.fire(), this.debounceMs);
   }
 
