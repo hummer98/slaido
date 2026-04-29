@@ -2,10 +2,9 @@
  * メインプロセス（エントリポイント）
  *
  * BrowserWindow を起動し、WebView との `host-message` / `__SLAIDO_RECEIVE__` 通信骨格を提供する。
- * 起動前に opencode サーバを spawn し、最後に開いた or 新規プロジェクトを bootstrap して
- * iframe へ file:// URL でスライドを表示する。
- * before-quit / process.exit 経由で opencode サーバを停止させる。
- * LLM 連携は後続タスクで opencode + OpenRouter 経由で実装予定。
+ * 起動前に opencode サーバを spawn し、ChatBridge を init してから projectStore を bootstrap、
+ * 続けて activeSession を作成して BrowserWindow を表示する。
+ * before-quit / process.exit 経由で opencode サーバと ChatBridge を停止させる。
  */
 
 import Electrobun, { BrowserWindow } from "electrobun/bun";
@@ -22,6 +21,8 @@ import { ProjectStore } from "./storage/project-store";
 import { ProjectStoreError } from "./storage/types";
 import type { Project } from "./storage/types";
 
+import { ChatBridge } from "./opencode/chat-bridge";
+import type { ChatEvent } from "./opencode/types";
 import { OpencodeServerManager } from "./opencode/server-manager";
 
 const ClientMessageSchema = z.discriminatedUnion("type", [
@@ -36,9 +37,15 @@ type ServerMessage =
   | { type: "message"; role: "assistant"; content: string }
   | { type: "slides"; html: string }
   | { type: "open-slides"; url: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "chat-event"; event: ChatEvent };
 
-const opencodeManager = new OpencodeServerManager();
+const opencodeManager = new OpencodeServerManager({
+  extraEnv: process.env.OPENROUTER_API_KEY
+    ? { OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY }
+    : undefined,
+});
+const chatBridge = new ChatBridge();
 
 const LastOpenedSchema = z.object({
   projectId: z.string().min(1),
@@ -100,27 +107,59 @@ function sendToWebView(win: BrowserWindow, msg: ServerMessage): void {
   );
 }
 
-function generateSlides(win: BrowserWindow, _seedContent: string): void {
-  // TODO(T009+): opencode SDK 経由で LLM を呼び出す
-  sendToWebView(win, {
-    type: "message",
-    role: "assistant",
-    content: "LLM 統合は未実装です。opencode + OpenRouter 連携を後続タスクで実装予定です。",
-  });
+async function generateSlides(
+  win: BrowserWindow,
+  activeSession: { sessionId: string } | null,
+  seedContent: string,
+): Promise<void> {
+  if (!activeSession) {
+    sendToWebView(win, { type: "error", message: "セッションが未初期化です" });
+    return;
+  }
+  try {
+    await chatBridge.sendMessage({
+      sessionId: activeSession.sessionId,
+      parts: [
+        {
+          type: "text",
+          text: `以下のシードドキュメントから reveal.js スライドを生成してください:\n\n${seedContent}`,
+        },
+      ],
+    });
+  } catch (err) {
+    sendToWebView(win, {
+      type: "error",
+      message: `生成失敗: ${(err as Error).message}`,
+    });
+  }
 }
 
-function refineSlides(win: BrowserWindow, _userMessage: string): void {
-  // TODO(T009+): opencode SDK 経由で LLM を呼び出す
-  sendToWebView(win, {
-    type: "message",
-    role: "assistant",
-    content: "LLM 統合は未実装です。",
-  });
+async function refineSlides(
+  win: BrowserWindow,
+  activeSession: { sessionId: string } | null,
+  userMessage: string,
+): Promise<void> {
+  if (!activeSession) {
+    sendToWebView(win, { type: "error", message: "セッションが未初期化です" });
+    return;
+  }
+  try {
+    await chatBridge.sendMessage({
+      sessionId: activeSession.sessionId,
+      parts: [{ type: "text", text: userMessage }],
+    });
+  } catch (err) {
+    sendToWebView(win, {
+      type: "error",
+      message: `送信失敗: ${(err as Error).message}`,
+    });
+  }
 }
 
 function attachHandlers(
   win: BrowserWindow,
   getActiveProject: () => Project | null,
+  getActiveSession: () => { sessionId: string } | null,
 ): void {
   win.webview.on("dom-ready", () => {
     console.log("[slAIdo] WebView 準備完了");
@@ -152,12 +191,12 @@ function attachHandlers(
       }
 
       if (msg.type === "generate") {
-        generateSlides(win, msg.seedContent);
+        void generateSlides(win, getActiveSession(), msg.seedContent);
         return;
       }
 
       if (msg.type === "chat") {
-        refineSlides(win, msg.content);
+        void refineSlides(win, getActiveSession(), msg.content);
         return;
       }
     } catch (err) {
@@ -167,10 +206,23 @@ function attachHandlers(
 }
 
 async function bootstrap(): Promise<void> {
+  let serverInfo;
   try {
-    await opencodeManager.start();
+    serverInfo = await opencodeManager.start();
   } catch (err) {
     console.error("[slAIdo] opencode 起動失敗:", err);
+    process.exit(1);
+  }
+
+  try {
+    await chatBridge.init({
+      baseUrl: serverInfo.baseUrl,
+      password: serverInfo.password,
+      username: serverInfo.username,
+    });
+    console.log("[slAIdo] chat-bridge ready");
+  } catch (err) {
+    console.error("[slAIdo] chat-bridge 初期化失敗:", err);
     process.exit(1);
   }
 
@@ -181,28 +233,47 @@ async function bootstrap(): Promise<void> {
 
   const store = new ProjectStore(projectsRoot, templateRoot);
   let activeProject: Project | null = null;
+  let activeSession: { sessionId: string } | null = null;
 
-  bootstrapProject(store)
-    .then((project) => {
-      activeProject = project;
-      console.log(
-        `[slAIdo] active project ${project.meta.id} title="${project.meta.title}" cwd=${project.cwd}`,
-      );
-    })
-    .catch((err) => {
-      console.error("[slAIdo] bootstrap failed:", err);
-    });
+  // bootstrap 順序を 1 並びに固定 (design-review 4-b)
+  try {
+    activeProject = await bootstrapProject(store);
+    console.log(
+      `[slAIdo] active project ${activeProject.meta.id} title="${activeProject.meta.title}" cwd=${activeProject.cwd}`,
+    );
+  } catch (err) {
+    console.error("[slAIdo] bootstrap project failed:", err);
+  }
+
+  if (activeProject) {
+    try {
+      activeSession = await chatBridge.createSession({
+        title: activeProject.meta.title,
+      });
+      console.log(`[slAIdo] active session ${activeSession.sessionId}`);
+    } catch (err) {
+      console.error("[slAIdo] createSession failed:", err);
+      activeSession = null;
+    }
+  }
 
   const win = new BrowserWindow({
     title: "slAIdo",
     frame: { x: 0, y: 0, width: 1280, height: 800 },
     url: "views://mainview/index.html",
   });
-  attachHandlers(win, () => activeProject);
+
+  // ChatBridge の正規化イベントを WebView へそのまま転送 (T013 で UI mapping を本格化する前提)
+  chatBridge.onEvent((ev) => {
+    sendToWebView(win, { type: "chat-event", event: ev });
+  });
+
+  attachHandlers(win, () => activeProject, () => activeSession);
 
   // before-quit は同期 emit (Node EventEmitter) で async は待たれない。
-  // SIGTERM は async 関数の同期部分で送られるため、await せずに stop() を呼ぶ.
+  // SIGTERM は async 関数の同期部分で送られるため、await せずに stop() を呼ぶ。
   Electrobun.events.on("before-quit", () => {
+    void chatBridge.dispose();
     void opencodeManager.stop();
   });
 
