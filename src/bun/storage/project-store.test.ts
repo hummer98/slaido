@@ -222,3 +222,25 @@ describe("ProjectStore.list", () => {
     expect(list[0]?.meta.title).toBe("ok");
   });
 });
+
+describe("ProjectStore.delete", () => {
+  it("create したものを削除できる", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    const project = await store.create({ title: "to-delete", seedText: "" });
+
+    await store.delete(project.meta.id);
+    expect(existsSync(project.cwd)).toBe(false);
+  });
+
+  it("再 delete は冪等", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    const project = await store.create({ title: "x", seedText: "" });
+    await store.delete(project.meta.id);
+    await store.delete(project.meta.id);
+  });
+
+  it("未知 ID は no-op", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    await store.delete("00000000-0000-4000-8000-000000000000");
+  });
+});

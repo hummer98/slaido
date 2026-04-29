@@ -149,6 +149,20 @@ export class ProjectStore {
     return projects;
   }
 
+  async delete(projectId: ProjectId): Promise<void> {
+    const cwd = this.getCwd(projectId);
+    try {
+      await rm(cwd, { recursive: true, force: true });
+      console.log(`[slAIdo:store] deleted project ${projectId}`);
+    } catch (err) {
+      throw new ProjectStoreError(
+        "DELETE_FAILED",
+        `delete failed: ${(err as Error)?.message ?? String(err)}`,
+        { cause: err },
+      );
+    }
+  }
+
   private toProject(meta: ProjectMeta): Project {
     const cwd = this.getCwd(meta.id);
     return {
