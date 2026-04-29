@@ -2,14 +2,21 @@
  * メインプロセス（エントリポイント）
  *
  * BrowserWindow を起動し、WebView との `host-message` / `__SLAIDO_RECEIVE__` 通信骨格を提供する。
- * 起動前に opencode サーバを spawn し、ChatBridge を init してから projectStore を bootstrap、
- * 続けて activeSession を作成して BrowserWindow を表示する。
+ *
+ * 起動順 (T009 + T010 統合):
+ *   1. ProjectStore を並行 bootstrap
+ *   2. BrowserWindow open
+ *   3. dom-ready 後に Keychain (or env fallback) からキー取得
+ *   4. キー有: opencode サーバを extraEnv で起動 → ChatBridge.init → createSession → open-slides
+ *   5. キー無: モーダルを request-api-key で開かせ、submit-api-key 経由で起動・検証
+ *
  * before-quit / process.exit 経由で opencode サーバと ChatBridge を停止させる。
  */
 
 import Electrobun, { BrowserWindow } from "electrobun/bun";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import {
@@ -21,31 +28,56 @@ import { ProjectStore } from "./storage/project-store";
 import { ProjectStoreError } from "./storage/types";
 import type { Project } from "./storage/types";
 
+import {
+  KeychainAdapter,
+  KeychainAccessError,
+  KeychainUnsupportedError,
+} from "./auth/keychain";
+import {
+  KeyValidationError,
+  maskApiKey,
+  validateApiKey,
+  writeMinimalConfigForValidation,
+} from "./auth/key-validator";
 import { ChatBridge } from "./opencode/chat-bridge";
 import type { ChatEvent } from "./opencode/types";
 import { OpencodeServerManager } from "./opencode/server-manager";
+import type { OpencodeServerInfo } from "./opencode/server-manager";
 
 const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ready") }),
   z.object({ type: z.literal("chat"), content: z.string() }),
   z.object({ type: z.literal("generate"), seedContent: z.string() }),
+  z.object({
+    type: z.literal("submit-api-key"),
+    key: z.string().min(20).startsWith("sk-or-"),
+  }),
+  z.object({ type: z.literal("open-signup-url") }),
+  z.object({ type: z.literal("reset-api-key") }),
 ]);
 
 type ClientMessage = z.infer<typeof ClientMessageSchema>;
+
+type ApiKeyErrorReason =
+  | "unauthorized"
+  | "rate_limit"
+  | "network"
+  | "keychain"
+  | "startup"
+  | "unknown";
 
 type ServerMessage =
   | { type: "message"; role: "assistant"; content: string }
   | { type: "slides"; html: string }
   | { type: "open-slides"; url: string }
   | { type: "error"; message: string }
-  | { type: "chat-event"; event: ChatEvent };
+  | { type: "chat-event"; event: ChatEvent }
+  | { type: "request-api-key" }
+  | { type: "api-key-validated" }
+  | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string };
 
-const opencodeManager = new OpencodeServerManager({
-  extraEnv: process.env.OPENROUTER_API_KEY
-    ? { OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY }
-    : undefined,
-});
-const chatBridge = new ChatBridge();
+const VALIDATION_CWD = join(tmpdir(), "slaido-opencode");
+const SIGNUP_URL = "https://openrouter.ai/settings/keys";
 
 const LastOpenedSchema = z.object({
   projectId: z.string().min(1),
@@ -109,15 +141,16 @@ function sendToWebView(win: BrowserWindow, msg: ServerMessage): void {
 
 async function generateSlides(
   win: BrowserWindow,
+  bridge: ChatBridge | null,
   activeSession: { sessionId: string } | null,
   seedContent: string,
 ): Promise<void> {
-  if (!activeSession) {
+  if (!bridge || !activeSession) {
     sendToWebView(win, { type: "error", message: "セッションが未初期化です" });
     return;
   }
   try {
-    await chatBridge.sendMessage({
+    await bridge.sendMessage({
       sessionId: activeSession.sessionId,
       parts: [
         {
@@ -136,15 +169,16 @@ async function generateSlides(
 
 async function refineSlides(
   win: BrowserWindow,
+  bridge: ChatBridge | null,
   activeSession: { sessionId: string } | null,
   userMessage: string,
 ): Promise<void> {
-  if (!activeSession) {
+  if (!bridge || !activeSession) {
     sendToWebView(win, { type: "error", message: "セッションが未初期化です" });
     return;
   }
   try {
-    await chatBridge.sendMessage({
+    await bridge.sendMessage({
       sessionId: activeSession.sessionId,
       parts: [{ type: "text", text: userMessage }],
     });
@@ -156,21 +190,19 @@ async function refineSlides(
   }
 }
 
+interface ApiKeyHandlers {
+  onSubmitApiKey: (key: string) => void | Promise<void>;
+  onResetApiKey: () => void | Promise<void>;
+  onOpenSignupUrl: () => void;
+}
+
 function attachHandlers(
   win: BrowserWindow,
   getActiveProject: () => Project | null,
+  getActiveBridge: () => ChatBridge | null,
   getActiveSession: () => { sessionId: string } | null,
+  apiKeyHandlers: ApiKeyHandlers,
 ): void {
-  win.webview.on("dom-ready", () => {
-    console.log("[slAIdo] WebView 準備完了");
-    const activeProject = getActiveProject();
-    if (activeProject) {
-      const url = pathToFileURL(activeProject.slidesEntry).href;
-      console.log(`[slAIdo] open-slides url=${url}`);
-      sendToWebView(win, { type: "open-slides", url });
-    }
-  });
-
   win.on("host-message", (event: unknown) => {
     try {
       if (typeof event !== "object" || event === null) return;
@@ -182,21 +214,31 @@ function attachHandlers(
 
       if (msg.type === "ready") {
         console.log("[slAIdo] クライアント接続");
-        const activeProject = getActiveProject();
-        if (activeProject) {
-          const url = pathToFileURL(activeProject.slidesEntry).href;
-          sendToWebView(win, { type: "open-slides", url });
-        }
         return;
       }
 
       if (msg.type === "generate") {
-        void generateSlides(win, getActiveSession(), msg.seedContent);
+        void generateSlides(win, getActiveBridge(), getActiveSession(), msg.seedContent);
         return;
       }
 
       if (msg.type === "chat") {
-        void refineSlides(win, getActiveSession(), msg.content);
+        void refineSlides(win, getActiveBridge(), getActiveSession(), msg.content);
+        return;
+      }
+
+      if (msg.type === "submit-api-key") {
+        void apiKeyHandlers.onSubmitApiKey(msg.key);
+        return;
+      }
+
+      if (msg.type === "reset-api-key") {
+        void apiKeyHandlers.onResetApiKey();
+        return;
+      }
+
+      if (msg.type === "open-signup-url") {
+        apiKeyHandlers.onOpenSignupUrl();
         return;
       }
     } catch (err) {
@@ -206,26 +248,6 @@ function attachHandlers(
 }
 
 async function bootstrap(): Promise<void> {
-  let serverInfo;
-  try {
-    serverInfo = await opencodeManager.start();
-  } catch (err) {
-    console.error("[slAIdo] opencode 起動失敗:", err);
-    process.exit(1);
-  }
-
-  try {
-    await chatBridge.init({
-      baseUrl: serverInfo.baseUrl,
-      password: serverInfo.password,
-      username: serverInfo.username,
-    });
-    console.log("[slAIdo] chat-bridge ready");
-  } catch (err) {
-    console.error("[slAIdo] chat-bridge 初期化失敗:", err);
-    process.exit(1);
-  }
-
   const projectsRoot = getProjectsRoot();
   const templateRoot = getBundledTemplateRoot();
   console.log(`[slAIdo] projectsRoot=${projectsRoot}`);
@@ -233,29 +255,10 @@ async function bootstrap(): Promise<void> {
 
   const store = new ProjectStore(projectsRoot, templateRoot);
   let activeProject: Project | null = null;
+  let activeManager: OpencodeServerManager | null = null;
+  let activeBridge: ChatBridge | null = null;
   let activeSession: { sessionId: string } | null = null;
-
-  // bootstrap 順序を 1 並びに固定 (design-review 4-b)
-  try {
-    activeProject = await bootstrapProject(store);
-    console.log(
-      `[slAIdo] active project ${activeProject.meta.id} title="${activeProject.meta.title}" cwd=${activeProject.cwd}`,
-    );
-  } catch (err) {
-    console.error("[slAIdo] bootstrap project failed:", err);
-  }
-
-  if (activeProject) {
-    try {
-      activeSession = await chatBridge.createSession({
-        title: activeProject.meta.title,
-      });
-      console.log(`[slAIdo] active session ${activeSession.sessionId}`);
-    } catch (err) {
-      console.error("[slAIdo] createSession failed:", err);
-      activeSession = null;
-    }
-  }
+  const keychain = new KeychainAdapter();
 
   const win = new BrowserWindow({
     title: "slAIdo",
@@ -263,23 +266,278 @@ async function bootstrap(): Promise<void> {
     url: "views://mainview/index.html",
   });
 
-  // ChatBridge の正規化イベントを WebView へそのまま転送 (T013 で UI mapping を本格化する前提)
-  chatBridge.onEvent((ev) => {
-    sendToWebView(win, { type: "chat-event", event: ev });
-  });
+  bootstrapProject(store)
+    .then((project) => {
+      activeProject = project;
+      console.log(
+        `[slAIdo] active project ${project.meta.id} title="${project.meta.title}" cwd=${project.cwd}`,
+      );
+      // 既に opencode が立ち上がっている場合、遅れてやってきた project を反映
+      if (activeManager) {
+        const url = pathToFileURL(project.slidesEntry).href;
+        sendToWebView(win, { type: "open-slides", url });
+      }
+    })
+    .catch((err) => {
+      console.error("[slAIdo] bootstrap failed:", err);
+    });
 
-  attachHandlers(win, () => activeProject, () => activeSession);
+  /**
+   * 既存の ChatBridge / Manager を停止する。再起動 (再入力 / 失敗ロールバック) で利用。
+   */
+  async function shutdownActiveServer(): Promise<void> {
+    if (activeBridge) {
+      try {
+        await activeBridge.dispose();
+      } catch (err) {
+        console.warn("[slAIdo] previous chat-bridge dispose failed:", err);
+      }
+      activeBridge = null;
+    }
+    activeSession = null;
+    if (activeManager) {
+      try {
+        await activeManager.stop();
+      } catch (err) {
+        console.warn("[slAIdo] previous manager stop failed:", err);
+      }
+      activeManager = null;
+    }
+  }
+
+  /**
+   * Keychain にキーが保存されている前提で opencode サーバ + ChatBridge を (再)起動し、
+   * 必要なら検証 prompt を打つ。
+   *
+   * - runValidation: false (2 回目以降の起動) では検証 prompt を省略
+   * - 失敗時は activeManager / activeBridge を null に戻し false を返す
+   */
+  async function startManagerWithKey(
+    key: string,
+    runValidation: boolean,
+  ): Promise<boolean> {
+    await shutdownActiveServer();
+
+    try {
+      await writeMinimalConfigForValidation(VALIDATION_CWD);
+    } catch (err) {
+      console.error("[slAIdo] opencode.json の配置に失敗:", err);
+      sendToWebView(win, {
+        type: "api-key-error",
+        reason: "startup",
+        message: `opencode.json の配置に失敗: ${(err as Error).message}`,
+      });
+      return false;
+    }
+
+    const manager = new OpencodeServerManager({
+      workingDirectory: VALIDATION_CWD,
+      extraEnv: { OPENROUTER_API_KEY: key },
+    });
+
+    let info: OpencodeServerInfo;
+    try {
+      info = await manager.start();
+    } catch (err) {
+      console.error("[slAIdo] opencode start failed:", err);
+      sendToWebView(win, {
+        type: "api-key-error",
+        reason: "startup",
+        message: (err as Error).message,
+      });
+      return false;
+    }
+    activeManager = manager;
+
+    if (runValidation) {
+      try {
+        await validateApiKey({ serverInfo: info });
+        console.log(`[slAIdo] api key validated (key=${maskApiKey(key)})`);
+      } catch (err) {
+        const reason: ApiKeyErrorReason =
+          err instanceof KeyValidationError ? err.reason : "unknown";
+        const httpStatus =
+          err instanceof KeyValidationError ? err.httpStatus : undefined;
+        console.error(
+          `[slAIdo] api key validation failed (key=${maskApiKey(key)}, httpStatus=${httpStatus ?? "n/a"}, reason=${reason}):`,
+          err,
+        );
+        sendToWebView(win, {
+          type: "api-key-error",
+          reason,
+          message: (err as Error).message,
+        });
+        try {
+          await manager.stop();
+        } catch {
+          // best-effort
+        }
+        activeManager = null;
+        return false;
+      }
+    }
+
+    // ChatBridge を初期化 (server 起動成功後)
+    const bridge = new ChatBridge();
+    bridge.onEvent((ev) => {
+      sendToWebView(win, { type: "chat-event", event: ev });
+    });
+    try {
+      await bridge.init({
+        baseUrl: info.baseUrl,
+        password: info.password,
+        username: info.username,
+      });
+    } catch (err) {
+      console.error("[slAIdo] chat-bridge 初期化失敗:", err);
+      sendToWebView(win, {
+        type: "api-key-error",
+        reason: "startup",
+        message: `chat-bridge init failed: ${(err as Error).message}`,
+      });
+      try {
+        await bridge.dispose();
+      } catch {
+        // best-effort
+      }
+      try {
+        await manager.stop();
+      } catch {
+        // best-effort
+      }
+      activeManager = null;
+      return false;
+    }
+    activeBridge = bridge;
+    console.log("[slAIdo] chat-bridge ready");
+
+    // active project があればセッションを作成
+    if (activeProject) {
+      try {
+        activeSession = await bridge.createSession({
+          title: activeProject.meta.title,
+        });
+        console.log(`[slAIdo] active session ${activeSession.sessionId}`);
+      } catch (err) {
+        console.error("[slAIdo] createSession failed:", err);
+        activeSession = null;
+      }
+    }
+
+    if (runValidation) {
+      sendToWebView(win, { type: "api-key-validated" });
+    } else {
+      console.log(
+        `[slAIdo] opencode ready (key=${maskApiKey(key)}, validation skipped)`,
+      );
+    }
+    return true;
+  }
+
+  attachHandlers(
+    win,
+    () => activeProject,
+    () => activeBridge,
+    () => activeSession,
+    {
+      onSubmitApiKey: async (key) => {
+        try {
+          await keychain.setApiKey(key);
+        } catch (err) {
+          if (err instanceof KeychainUnsupportedError) {
+            sendToWebView(win, {
+              type: "api-key-error",
+              reason: "keychain",
+              message:
+                "macOS 以外では env (OPENROUTER_API_KEY) 経由のみサポートします。",
+            });
+            return;
+          }
+          if (err instanceof KeychainAccessError) {
+            sendToWebView(win, {
+              type: "api-key-error",
+              reason: "keychain",
+              message: err.message,
+            });
+            return;
+          }
+          sendToWebView(win, {
+            type: "api-key-error",
+            reason: "keychain",
+            message: (err as Error).message,
+          });
+          return;
+        }
+        const ok = await startManagerWithKey(key, true);
+        if (ok && activeProject) {
+          const url = pathToFileURL(activeProject.slidesEntry).href;
+          sendToWebView(win, { type: "open-slides", url });
+        }
+      },
+      onResetApiKey: async () => {
+        await shutdownActiveServer();
+        try {
+          await keychain.deleteApiKey();
+        } catch (err) {
+          if (!(err instanceof KeychainUnsupportedError)) {
+            console.warn("[slAIdo] keychain delete failed:", err);
+          }
+        }
+        sendToWebView(win, { type: "request-api-key" });
+      },
+      onOpenSignupUrl: () => {
+        try {
+          Electrobun.Utils.openExternal(SIGNUP_URL);
+        } catch (err) {
+          console.error("[slAIdo] openExternal failed:", err);
+        }
+      },
+    },
+  );
+
+  win.webview.on("dom-ready", async () => {
+    console.log("[slAIdo] WebView 準備完了");
+    let key: string | null = null;
+    try {
+      key = await keychain.getApiKey();
+    } catch (err) {
+      console.error("[slAIdo] keychain getApiKey failed:", err);
+      sendToWebView(win, {
+        type: "api-key-error",
+        reason: "keychain",
+        message: (err as Error).message,
+      });
+      return;
+    }
+
+    if (!key) {
+      sendToWebView(win, { type: "request-api-key" });
+      return;
+    }
+
+    // 2 回目以降: 起動だけ走らせ、検証 prompt は省略 (トークン節約)
+    const ok = await startManagerWithKey(key, false);
+    if (!ok) {
+      sendToWebView(win, { type: "request-api-key" });
+      return;
+    }
+
+    if (activeProject) {
+      const url = pathToFileURL(activeProject.slidesEntry).href;
+      sendToWebView(win, { type: "open-slides", url });
+    }
+  });
 
   // before-quit は同期 emit (Node EventEmitter) で async は待たれない。
   // SIGTERM は async 関数の同期部分で送られるため、await せずに stop() を呼ぶ。
   Electrobun.events.on("before-quit", () => {
-    void chatBridge.dispose();
-    void opencodeManager.stop();
+    void activeBridge?.dispose();
+    void activeManager?.stop();
   });
 
   // 保険: 万一 before-quit が emit されないパスでも SIGTERM を届ける.
   process.on("exit", () => {
-    const info = opencodeManager.getInfo();
+    const info = activeManager?.getInfo();
     if (info) {
       try {
         process.kill(info.pid, "SIGTERM");

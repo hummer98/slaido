@@ -28,12 +28,29 @@ type ChatEventMin =
   | { type: "error"; sessionId?: string; reason: string }
   | { type: string; [k: string]: unknown };
 
+type ApiKeyErrorReason =
+  | "unauthorized"
+  | "rate_limit"
+  | "network"
+  | "keychain"
+  | "startup"
+  | "unknown";
+
 type ServerMessage =
   | { type: "message"; role: "assistant"; content: string }
   | { type: "slides"; html: string }
   | { type: "open-slides"; url: string }
   | { type: "error"; message: string }
-  | { type: "chat-event"; event: ChatEventMin };
+  | { type: "chat-event"; event: ChatEventMin }
+  | { type: "request-api-key" }
+  | { type: "api-key-validated" }
+  | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string };
+
+declare global {
+  interface Window {
+    __SLAIDO_RECEIVE__: (msg: ServerMessage) => void;
+  }
+}
 
 const chatMessages = document.getElementById("chat-messages") as HTMLDivElement;
 const seedInput = document.getElementById("seed-input") as HTMLTextAreaElement;
@@ -43,6 +60,13 @@ const sendBtn = document.getElementById("send-btn") as HTMLButtonElement;
 const previewIframe = document.getElementById("preview-iframe") as HTMLIFrameElement;
 const previewEmpty = document.getElementById("preview-empty") as HTMLDivElement;
 const previewStatus = document.getElementById("preview-status") as HTMLSpanElement;
+
+const apiKeyModal = document.getElementById("api-key-modal") as HTMLDivElement;
+const apiKeyInput = document.getElementById("api-key-input") as HTMLInputElement;
+const apiKeyError = document.getElementById("api-key-error") as HTMLDivElement;
+const apiKeySubmitBtn = document.getElementById("api-key-submit-btn") as HTMLButtonElement;
+const apiKeySignupBtn = document.getElementById("api-key-signup-btn") as HTMLButtonElement;
+const apiKeyResetLink = document.getElementById("api-key-reset-link") as HTMLButtonElement;
 
 let isGenerating = false;
 
@@ -96,6 +120,61 @@ function openSlidesUrl(url: string): void {
 }
 
 /**
+ * 入力値が API キーとして妥当かを判定する (main 側 zod と同条件、plan F5).
+ */
+function isValidApiKeyInput(value: string): boolean {
+  return value.length >= 20 && value.startsWith("sk-or-");
+}
+
+/**
+ * モーダル表示中はチャット入力を無効化する。
+ */
+function setChatDisabled(disabled: boolean): void {
+  seedInput.disabled = disabled;
+  chatInput.disabled = disabled;
+  generateBtn.disabled = disabled || isGenerating;
+  sendBtn.disabled = disabled || isGenerating;
+}
+
+function showApiKeyModal(): void {
+  apiKeyModal.classList.remove("hidden");
+  apiKeyModal.setAttribute("aria-hidden", "false");
+  apiKeyError.classList.add("hidden");
+  apiKeyError.textContent = "";
+  apiKeyInput.value = "";
+  apiKeySubmitBtn.disabled = true;
+  setChatDisabled(true);
+  // 表示直後にフォーカス
+  setTimeout(() => apiKeyInput.focus(), 0);
+}
+
+function hideApiKeyModal(): void {
+  apiKeyModal.classList.add("hidden");
+  apiKeyModal.setAttribute("aria-hidden", "true");
+  apiKeyError.classList.add("hidden");
+  apiKeyError.textContent = "";
+  apiKeyInput.value = "";
+  setChatDisabled(false);
+}
+
+function showApiKeyError(reason: ApiKeyErrorReason, message?: string): void {
+  const text =
+    {
+      unauthorized: "API キーが無効です。",
+      rate_limit: "OpenRouter のレート制限に達しました。少し待ってからやり直してください。",
+      network: "OpenRouter への通信に失敗しました。ネットワーク状況を確認してください。",
+      keychain: "Keychain への保存に失敗しました。",
+      startup: "opencode サーバの起動に失敗しました。",
+      unknown: "不明なエラーが発生しました。",
+    }[reason] ?? "不明なエラーが発生しました。";
+
+  apiKeyError.textContent = message ? `${text} (${message})` : text;
+  apiKeyError.classList.remove("hidden");
+  apiKeyInput.focus();
+  apiKeyInput.select();
+}
+
+/**
  * メインプロセスからのメッセージを受信する。
  */
 window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
@@ -116,7 +195,7 @@ window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
   }
 
   if (msg.type === "error") {
-    appendMessage("error", (msg as { content?: string }).content ?? msg.message);
+    appendMessage("error", msg.message);
     setGenerating(false);
     return;
   }
@@ -140,6 +219,21 @@ window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
       return;
     }
     // raw / reasoning-chunk / tool-status / permission-request は T013 で UI 化
+    return;
+  }
+
+  if (msg.type === "request-api-key") {
+    showApiKeyModal();
+    return;
+  }
+
+  if (msg.type === "api-key-validated") {
+    hideApiKeyModal();
+    return;
+  }
+
+  if (msg.type === "api-key-error") {
+    showApiKeyError(msg.reason, msg.message);
     return;
   }
 };
@@ -184,14 +278,49 @@ function sendChatMessage(): void {
   __electrobunSendToHost({ type: "chat", content });
 }
 
+// API キーモーダルの結線
+apiKeyInput.addEventListener("input", () => {
+  const value = apiKeyInput.value.trim();
+  apiKeySubmitBtn.disabled = !isValidApiKeyInput(value);
+  if (!apiKeyError.classList.contains("hidden")) {
+    apiKeyError.classList.add("hidden");
+    apiKeyError.textContent = "";
+  }
+});
+
+apiKeyInput.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    if (!apiKeySubmitBtn.disabled) {
+      submitApiKey();
+    }
+  }
+});
+
+apiKeySubmitBtn.addEventListener("click", () => {
+  submitApiKey();
+});
+
+apiKeySignupBtn.addEventListener("click", () => {
+  __electrobunSendToHost({ type: "open-signup-url" });
+});
+
+apiKeyResetLink.addEventListener("click", (ev) => {
+  ev.preventDefault();
+  __electrobunSendToHost({ type: "reset-api-key" });
+});
+
+function submitApiKey(): void {
+  const value = apiKeyInput.value.trim();
+  if (!isValidApiKeyInput(value)) return;
+  apiKeySubmitBtn.disabled = true;
+  apiKeyError.classList.add("hidden");
+  apiKeyError.textContent = "";
+  __electrobunSendToHost({ type: "submit-api-key", key: value });
+}
+
 // メインプロセスに準備完了を通知
 __electrobunSendToHost({ type: "ready" });
 
-// グローバルに公開（メインプロセスから executeJavascript で呼び出せるように）
-declare global {
-  interface Window {
-    __SLAIDO_RECEIVE__: (msg: ServerMessage) => void;
-  }
-}
-
+// このファイルをモジュールとして扱わせ、`declare global` を有効化する。
 export {};
