@@ -6,8 +6,11 @@
  * 副作用込みの `exportHtmlZip` (cycle 4) に分離する設計.
  */
 
-import { cp, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { ZipFailedError } from "./errors";
 
 const ILLEGAL_DIR_CHARS = /[\/:]/g;
 
@@ -99,6 +102,101 @@ async function scrubMacOsArtifacts(root: string): Promise<void> {
     if (ent.isDirectory()) {
       await scrubMacOsArtifacts(child);
     }
+  }
+}
+
+export interface ExportHtmlZipArgs {
+  /** プロジェクトの slides ディレクトリ (絶対 path) */
+  slidesDir: string;
+  /** reveal.js dist ディレクトリ (絶対 path) */
+  distDir: string;
+  /** 出力 zip ファイル (絶対 path). 既存ファイルがあれば上書き */
+  outputPath: string;
+  /** プロジェクト title. zip ルートディレクトリ名に使う */
+  title: string;
+  /** ユーザーキャンセル (将来拡張. 現状は spawn 中の kill 用フック) */
+  signal?: AbortSignal;
+}
+
+export interface ExportHtmlZipDeps {
+  /** spawn 注入. `string[]` cmd + cwd を受け取り、終了コードを返す */
+  spawnZip?: (args: string[], cwd: string) => Promise<{ exitCode: number; stderr: string }>;
+}
+
+const ZIP_BIN = "/usr/bin/zip";
+
+async function defaultSpawnZip(
+  args: string[],
+  cwd: string,
+): Promise<{ exitCode: number; stderr: string }> {
+  const proc = Bun.spawn([ZIP_BIN, ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  const stderr = await new Response(proc.stderr).text();
+  // stdout は読み捨てる (zip はファイルリストを stdout に出すが今回は不要)
+  await new Response(proc.stdout).text();
+  const exitCode = await proc.exited;
+  return { exitCode, stderr };
+}
+
+/**
+ * exportHtmlZip — slides + dist + README を `<title>/` 階層に集約して zip 化.
+ *
+ * 失敗時もテンポラリは finally で削除し、出力 path は best-effort で unlink.
+ */
+export async function exportHtmlZip(
+  args: ExportHtmlZipArgs,
+  deps: ExportHtmlZipDeps = {},
+): Promise<void> {
+  const spawnZip = deps.spawnZip ?? defaultSpawnZip;
+
+  // 既存出力ファイルを削除 (zip のデフォルトは update なので / Minor m2)
+  await unlink(args.outputPath).catch(() => {});
+
+  const stagingRoot = await mkdtemp(join(tmpdir(), "slaido-export-"));
+  try {
+    const { rootDirName } = await assembleStaging({
+      srcSlidesDir: args.slidesDir,
+      distDir: args.distDir,
+      stagingRoot,
+      title: args.title,
+    });
+
+    // verifyNoExternalRefs は warning ログを残すだけで失敗扱いにしない
+    try {
+      const indexPath = join(stagingRoot, rootDirName, "index.html");
+      const v = await verifyNoExternalRefs(indexPath);
+      if (!v.ok) {
+        console.warn(
+          `[slAIdo] export-html-zip external-refs detected ${JSON.stringify({
+            count: v.externalRefs.length,
+            samples: v.externalRefs.slice(0, 3),
+          })}`,
+        );
+      }
+    } catch (err) {
+      console.warn("[slAIdo] export-html-zip verifyNoExternalRefs failed:", err);
+    }
+
+    const { exitCode, stderr } = await spawnZip(
+      [
+        "-r",
+        "-X",
+        "--exclude=*/.DS_Store",
+        "--exclude=__MACOSX/*",
+        args.outputPath,
+        rootDirName,
+      ],
+      stagingRoot,
+    );
+
+    if (exitCode !== 0) {
+      await unlink(args.outputPath).catch(() => {});
+      throw new ZipFailedError(
+        `zip failed (exit=${exitCode}): ${stderr.trim() || "(no stderr)"}`,
+        exitCode,
+      );
+    }
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true });
   }
 }
 

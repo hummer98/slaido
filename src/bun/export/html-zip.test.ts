@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   assembleStaging,
+  exportHtmlZip,
   sanitizeStagingDirName,
   verifyNoExternalRefs,
 } from "./html-zip";
@@ -105,6 +106,87 @@ describe("assembleStaging", () => {
 
     expect(result.rootDirName).toBe("a_b_c");
     expect(await Bun.file(join(stagingRoot, "a_b_c", "index.html")).exists()).toBe(true);
+  });
+});
+
+async function runUnzip(args: string[]): Promise<{ stdout: string; exitCode: number }> {
+  const proc = Bun.spawn(["/usr/bin/unzip", ...args], { stdout: "pipe", stderr: "pipe" });
+  const stdout = await new Response(proc.stdout).text();
+  const exitCode = await proc.exited;
+  return { stdout, exitCode };
+}
+
+describe("exportHtmlZip", () => {
+  let cleanupDirs: string[] = [];
+  afterEach(async () => {
+    for (const dir of cleanupDirs) {
+      await rm(dir, { recursive: true, force: true });
+    }
+    cleanupDirs = [];
+  });
+
+  it("creates a zip with index.html / dist/reveal.js, no .DS_Store / __MACOSX", async () => {
+    // 元 slides を tmp にコピーして .DS_Store を仕込む
+    const stagingArea = await mkdtemp(join(tmpdir(), "slaido-zipsrc-"));
+    cleanupDirs.push(stagingArea);
+    const slides = join(stagingArea, "slides");
+    await mkdir(slides, { recursive: true });
+    await writeFile(
+      join(slides, "index.html"),
+      `<!DOCTYPE html><html><head><link rel="stylesheet" href="dist/reveal.css"></head><body></body></html>`,
+      "utf8",
+    );
+    await writeFile(join(slides, ".DS_Store"), "macgarbage", "binary");
+
+    const outputDir = await mkdtemp(join(tmpdir(), "slaido-zipout-"));
+    cleanupDirs.push(outputDir);
+    const outputPath = join(outputDir, "deck.zip");
+
+    await exportHtmlZip({
+      slidesDir: slides,
+      distDir: join(FIXTURE_REVEAL_MINI, "dist"),
+      outputPath,
+      title: "deck",
+    });
+
+    expect(await Bun.file(outputPath).exists()).toBe(true);
+
+    const list = await runUnzip(["-l", outputPath]);
+    expect(list.exitCode).toBe(0);
+    expect(list.stdout).toContain("deck/index.html");
+    expect(list.stdout).toContain("deck/dist/reveal.js");
+    expect(list.stdout).toContain("deck/README.txt");
+    expect(list.stdout).not.toContain(".DS_Store");
+    expect(list.stdout).not.toContain("__MACOSX");
+
+    // 別 tmp に解凍して中身検証
+    const extractDir = await mkdtemp(join(tmpdir(), "slaido-extract-"));
+    cleanupDirs.push(extractDir);
+    const extract = await runUnzip(["-q", outputPath, "-d", extractDir]);
+    expect(extract.exitCode).toBe(0);
+    expect(await Bun.file(join(extractDir, "deck", "index.html")).exists()).toBe(true);
+    expect(await Bun.file(join(extractDir, "deck", "dist", "reveal.js")).exists()).toBe(true);
+  });
+
+  it("overwrites pre-existing output zip (Minor m2)", async () => {
+    const outputDir = await mkdtemp(join(tmpdir(), "slaido-zipout-"));
+    cleanupDirs.push(outputDir);
+    const outputPath = join(outputDir, "out.zip");
+    // 古い zip を残しておく (中に存在しないエントリだけが入っている状態を想定)
+    await writeFile(outputPath, "PK_OLD_GARBAGE", "binary");
+
+    await exportHtmlZip({
+      slidesDir: join(FIXTURE_REVEAL_MINI, "slides"),
+      distDir: join(FIXTURE_REVEAL_MINI, "dist"),
+      outputPath,
+      title: "fresh",
+    });
+
+    const list = await runUnzip(["-l", outputPath]);
+    expect(list.exitCode).toBe(0);
+    expect(list.stdout).toContain("fresh/index.html");
+    // 古い garbage 由来の余計なエントリは存在しない (新 zip なので中身は fresh/ のみ).
+    expect(list.stdout).not.toContain("PK_OLD_GARBAGE");
   });
 });
 
