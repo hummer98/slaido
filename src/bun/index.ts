@@ -44,6 +44,11 @@ import type { ChatEvent } from "./opencode/types";
 import { OpencodeServerManager } from "./opencode/server-manager";
 import type { OpencodeServerInfo } from "./opencode/server-manager";
 import { PreviewSync } from "./preview/preview-sync";
+import {
+  handleExportHtmlZip,
+  handleExportPdf,
+  type ExportProgressMessage,
+} from "./export";
 
 const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ready") }),
@@ -55,6 +60,8 @@ const ClientMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("open-signup-url") }),
   z.object({ type: z.literal("reset-api-key") }),
+  z.object({ type: z.literal("export-pdf") }),
+  z.object({ type: z.literal("export-html-zip") }),
 ]);
 
 type ClientMessage = z.infer<typeof ClientMessageSchema>;
@@ -75,7 +82,8 @@ type ServerMessage =
   | { type: "chat-event"; event: ChatEvent }
   | { type: "request-api-key" }
   | { type: "api-key-validated" }
-  | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string };
+  | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string }
+  | ExportProgressMessage;
 
 const VALIDATION_CWD = join(tmpdir(), "slaido-opencode");
 const SIGNUP_URL = "https://openrouter.ai/settings/keys";
@@ -228,6 +236,7 @@ function attachHandlers(
   getActiveBridge: () => ChatBridge | null,
   getActiveSession: () => { sessionId: string } | null,
   apiKeyHandlers: ApiKeyHandlers,
+  templateRoot: string,
 ): void {
   win.on("host-message", (event: unknown) => {
     try {
@@ -265,6 +274,50 @@ function attachHandlers(
 
       if (msg.type === "open-signup-url") {
         apiKeyHandlers.onOpenSignupUrl();
+        return;
+      }
+
+      if (msg.type === "export-pdf") {
+        const project = getActiveProject();
+        if (!project) {
+          sendToWebView(win, {
+            type: "export-progress",
+            kind: "pdf",
+            phase: "error",
+            message: "プロジェクトが未初期化です",
+          });
+          return;
+        }
+        void handleExportPdf(
+          {
+            title: project.meta.title,
+            slidesEntry: project.slidesEntry,
+            templateRoot,
+          },
+          { send: (m) => sendToWebView(win, m) },
+        );
+        return;
+      }
+
+      if (msg.type === "export-html-zip") {
+        const project = getActiveProject();
+        if (!project) {
+          sendToWebView(win, {
+            type: "export-progress",
+            kind: "html-zip",
+            phase: "error",
+            message: "プロジェクトが未初期化です",
+          });
+          return;
+        }
+        void handleExportHtmlZip(
+          {
+            title: project.meta.title,
+            slidesDir: join(project.cwd, "slides"),
+            templateRoot,
+          },
+          { send: (m) => sendToWebView(win, m) },
+        );
         return;
       }
     } catch (err) {
@@ -545,6 +598,7 @@ async function bootstrap(): Promise<void> {
         }
       },
     },
+    templateRoot,
   );
 
   win.webview.on("dom-ready", async () => {

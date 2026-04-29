@@ -36,6 +36,18 @@ type ApiKeyErrorReason =
   | "startup"
   | "unknown";
 
+type ExportKind = "pdf" | "html-zip";
+type ExportPhase = "start" | "done" | "error" | "canceled";
+
+type ExportProgressMessage = {
+  type: "export-progress";
+  kind: ExportKind;
+  phase: ExportPhase;
+  message?: string;
+  category?: string;
+  silent?: boolean;
+};
+
 type ServerMessage =
   | { type: "message"; role: "assistant"; content: string }
   | { type: "slides"; html: string }
@@ -44,7 +56,8 @@ type ServerMessage =
   | { type: "chat-event"; event: ChatEventMin }
   | { type: "request-api-key" }
   | { type: "api-key-validated" }
-  | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string };
+  | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string }
+  | ExportProgressMessage;
 
 declare global {
   interface Window {
@@ -67,6 +80,24 @@ const apiKeyError = document.getElementById("api-key-error") as HTMLDivElement;
 const apiKeySubmitBtn = document.getElementById("api-key-submit-btn") as HTMLButtonElement;
 const apiKeySignupBtn = document.getElementById("api-key-signup-btn") as HTMLButtonElement;
 const apiKeyResetLink = document.getElementById("api-key-reset-link") as HTMLButtonElement;
+
+const exportPdfBtn = document.getElementById("export-pdf-btn") as HTMLButtonElement;
+const exportHtmlZipBtn = document.getElementById("export-html-zip-btn") as HTMLButtonElement;
+
+const EXPORT_LABELS: Record<ExportKind, { idle: string; running: string }> = {
+  pdf: { idle: "PDF として保存", running: "PDF 作成中..." },
+  "html-zip": { idle: "HTML として書き出し", running: "ZIP 作成中..." },
+};
+
+function getExportButton(kind: ExportKind): HTMLButtonElement {
+  return kind === "pdf" ? exportPdfBtn : exportHtmlZipBtn;
+}
+
+function setExportRunning(kind: ExportKind, running: boolean): void {
+  const btn = getExportButton(kind);
+  btn.disabled = running;
+  btn.textContent = running ? EXPORT_LABELS[kind].running : EXPORT_LABELS[kind].idle;
+}
 
 let isGenerating = false;
 
@@ -236,7 +267,24 @@ window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
     showApiKeyError(msg.reason, msg.message);
     return;
   }
+
+  if (msg.type === "export-progress") {
+    handleExportProgress(msg);
+    return;
+  }
 };
+
+function handleExportProgress(msg: ExportProgressMessage): void {
+  if (msg.phase === "start") {
+    setExportRunning(msg.kind, true);
+    return;
+  }
+  // done / error / canceled いずれもボタンは復帰
+  setExportRunning(msg.kind, false);
+  if (msg.phase === "error" && !msg.silent && msg.message) {
+    appendMessage("error", `[export:${msg.kind}] ${msg.message}`);
+  }
+}
 
 function setGenerating(value: boolean): void {
   isGenerating = value;
@@ -318,6 +366,16 @@ function submitApiKey(): void {
   apiKeyError.textContent = "";
   __electrobunSendToHost({ type: "submit-api-key", key: value });
 }
+
+exportPdfBtn.addEventListener("click", () => {
+  if (exportPdfBtn.disabled) return;
+  __electrobunSendToHost({ type: "export-pdf" });
+});
+
+exportHtmlZipBtn.addEventListener("click", () => {
+  if (exportHtmlZipBtn.disabled) return;
+  __electrobunSendToHost({ type: "export-html-zip" });
+});
 
 // メインプロセスに準備完了を通知
 __electrobunSendToHost({ type: "ready" });
