@@ -10,6 +10,7 @@ declare function __electrobunSendToHost(data: unknown): void;
 type ServerMessage =
   | { type: "message"; role: "assistant"; content: string }
   | { type: "slides"; html: string }
+  | { type: "open-slides"; url: string }
   | { type: "error"; message: string };
 
 const chatMessages = document.getElementById("chat-messages") as HTMLDivElement;
@@ -35,13 +36,25 @@ function appendMessage(role: "user" | "assistant" | "error", content: string): v
 }
 
 /**
- * スライドプレビューを更新する。
+ * スライドプレビューを srcdoc で更新する（旧経路。T012 で chokidar に倒れた場合の予備）。
  */
 function updatePreview(html: string): void {
   previewEmpty.style.display = "none";
   previewIframe.style.display = "block";
+  previewIframe.removeAttribute("src");
   previewIframe.srcdoc = html;
   previewStatus.textContent = "生成済み";
+}
+
+/**
+ * スライドプレビューを file:// or http:// URL で更新する。
+ */
+function openSlidesUrl(url: string): void {
+  previewEmpty.style.display = "none";
+  previewIframe.style.display = "block";
+  previewIframe.removeAttribute("srcdoc");
+  previewIframe.src = url;
+  previewStatus.textContent = "テンプレ表示中";
 }
 
 /**
@@ -56,6 +69,11 @@ window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
 
   if (msg.type === "slides") {
     updatePreview(msg.html);
+    return;
+  }
+
+  if (msg.type === "open-slides") {
+    openSlidesUrl(msg.url);
     return;
   }
 
