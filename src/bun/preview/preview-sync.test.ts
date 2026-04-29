@@ -377,3 +377,82 @@ describe("PreviewSync SSE trigger", () => {
     expect(updates.length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cycle 4: chokidar 経路の発火 (実 fs)
+// ---------------------------------------------------------------------------
+
+describe("PreviewSync chokidar trigger (real fs)", () => {
+  let env: TestEnv;
+  let sync: PreviewSync;
+  let sub: ReturnType<typeof makeSubscribe>;
+  let updates: PreviewUpdateInfo[];
+
+  beforeEach(async () => {
+    env = await setupTestEnv();
+    sync = new PreviewSync({ debounceMs: 30, silent: true });
+    sub = makeSubscribe(env);
+    updates = [];
+    sync.onUpdate((info) => updates.push(info));
+    await sync.start({
+      projectId: "p1",
+      cwd: env.cwd,
+      slidesEntry: env.slidesEntry,
+      subscribeChatEvents: sub.subscribe,
+    });
+  });
+
+  afterEach(async () => {
+    await sync.stop();
+    await env.cleanup();
+  });
+
+  test("writing to slidesEntry fires onUpdate (source=chokidar)", async () => {
+    await writeFile(env.slidesEntry, "<html><body>v1</body></html>", "utf8");
+    // awaitWriteFinish 30ms + debounce 30ms + α
+    await waitMs(200);
+    expect(updates.length).toBe(1);
+    expect(updates[0]!.source).toBe("chokidar");
+    expect(sync.getCounters().chokidarOnly).toBe(1);
+  });
+
+  test("writes to other.html (different file) are ignored", async () => {
+    await writeFile(
+      join(env.slidesDir, "other.html"),
+      "<html><body>other</body></html>",
+      "utf8",
+    );
+    await waitMs(200);
+    expect(updates.length).toBe(0);
+  });
+
+  test("swap files (~ / .swp / .tmp) are ignored", async () => {
+    await writeFile(
+      `${env.slidesEntry}~`,
+      "<html><body>swap</body></html>",
+      "utf8",
+    );
+    await writeFile(
+      join(env.slidesDir, ".index.html.swp"),
+      "vim swp",
+      "utf8",
+    );
+    await writeFile(
+      join(env.slidesDir, "index.html.tmp"),
+      "<html><body>tmp</body></html>",
+      "utf8",
+    );
+    await waitMs(200);
+    expect(updates.length).toBe(0);
+  });
+
+  test("multiple writes within debounce are coalesced into 1 reload", async () => {
+    await writeFile(env.slidesEntry, "<html><body>v1</body></html>", "utf8");
+    await waitMs(5);
+    await writeFile(env.slidesEntry, "<html><body>v2</body></html>", "utf8");
+    await waitMs(5);
+    await writeFile(env.slidesEntry, "<html><body>v3</body></html>", "utf8");
+    await waitMs(250);
+    expect(updates.length).toBe(1);
+  });
+});
