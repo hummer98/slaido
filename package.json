@@ -9,8 +9,9 @@
   },
   "scripts": {
     "start": "bun run build:dev && ./node_modules/.bin/electrobun dev",
-    "build:dev": "bun install && ./node_modules/.bin/electrobun build",
-    "build:prod": "bun install && ./node_modules/.bin/electrobun build --env=stable",
+    "build:dev": "bun install && bun run fetchOpencode && ./node_modules/.bin/electrobun build",
+    "build:prod": "bun install && bun run fetchOpencode && ./node_modules/.bin/electrobun build --env=stable",
+    "fetchOpencode": "bun run scripts/fetch-opencode.ts",
     "test": "bun test"
   },
   "dependencies": {

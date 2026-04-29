@@ -1,0 +1,13 @@
+{
+  "version": "1.14.29",
+  "binaries": {
+    "darwin-arm64": {
+      "url": "https://github.com/sst/opencode/releases/download/v1.14.29/opencode-darwin-arm64.zip",
+      "sha256": "39c483fe12cffe07bfc050d59df534ca1b5d29d9232da237586f1b6a2ef1c7e1"
+    },
+    "darwin-x64": {
+      "url": "https://github.com/sst/opencode/releases/download/v1.14.29/opencode-darwin-x64.zip",
+      "sha256": "60d1c577998e5171183d55bf91e3bc699d5d91ab9998985d82240c87e2f30fec"
+    }
+  }
+}

@@ -42,6 +42,8 @@ export default {
       "assets/templates/reveal/dist/theme/fonts/source-sans-pro/source-sans-pro-semibolditalic.eot": "Resources/templates/reveal/dist/theme/fonts/source-sans-pro/source-sans-pro-semibolditalic.eot",
       "assets/templates/reveal/dist/theme/fonts/source-sans-pro/source-sans-pro-semibolditalic.ttf": "Resources/templates/reveal/dist/theme/fonts/source-sans-pro/source-sans-pro-semibolditalic.ttf",
       "assets/templates/reveal/dist/theme/fonts/source-sans-pro/source-sans-pro-semibolditalic.woff": "Resources/templates/reveal/dist/theme/fonts/source-sans-pro/source-sans-pro-semibolditalic.woff",
+      "bin/darwin-arm64/opencode": "bin/darwin-arm64/opencode",
+      "bin/darwin-x64/opencode": "bin/darwin-x64/opencode",
     },
   },
 } satisfies ElectrobunConfig;
