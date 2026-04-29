@@ -183,3 +183,42 @@ describe("ProjectStore.load", () => {
     expect((caught as ProjectStoreError).code).toBe("META_CORRUPTED");
   });
 });
+
+describe("ProjectStore.list", () => {
+  it("projectsRoot 不在は空配列", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    const list = await store.list();
+    expect(list).toEqual([]);
+  });
+
+  it("updatedAt 降順で返る", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    const a = await store.create({ title: "A", seedText: "" });
+    const b = await store.create({ title: "B", seedText: "" });
+    const c = await store.create({ title: "C", seedText: "" });
+
+    const overwriteUpdatedAt = async (cwd: string, iso: string) => {
+      const meta = JSON.parse(await readFile(join(cwd, "meta.json"), "utf8"));
+      meta.updatedAt = iso;
+      await writeFile(join(cwd, "meta.json"), JSON.stringify(meta));
+    };
+    await overwriteUpdatedAt(a.cwd, "2026-01-02T00:00:00.000Z");
+    await overwriteUpdatedAt(b.cwd, "2026-01-03T00:00:00.000Z");
+    await overwriteUpdatedAt(c.cwd, "2026-01-01T00:00:00.000Z");
+
+    const list = await store.list();
+    expect(list.map((p) => p.meta.title)).toEqual(["B", "A", "C"]);
+  });
+
+  it("meta.json 欠損ディレクトリはスキップ", async () => {
+    const store = new ProjectStore(projectsRoot, FIXTURE_TEMPLATE_ROOT);
+    await store.create({ title: "ok", seedText: "" });
+
+    const orphan = join(projectsRoot, "orphan-dir");
+    await mkdir(orphan, { recursive: true });
+
+    const list = await store.list();
+    expect(list).toHaveLength(1);
+    expect(list[0]?.meta.title).toBe("ok");
+  });
+});

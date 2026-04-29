@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { copyRevealTemplate } from "./template-copier";
 import {
@@ -114,6 +114,39 @@ export class ProjectStore {
     console.log(`[slAIdo:store] loaded project ${result.data.id} title="${result.data.title}"`);
 
     return this.toProject(result.data);
+  }
+
+  async list(): Promise<Project[]> {
+    let entries: string[];
+    try {
+      const dirents = await readdir(this.projectsRoot, { withFileTypes: true });
+      entries = dirents.filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch (err) {
+      if (isErrnoException(err) && err.code === "ENOENT") return [];
+      throw new ProjectStoreError(
+        "IO_ERROR",
+        `list failed: ${(err as Error)?.message ?? String(err)}`,
+        { cause: err },
+      );
+    }
+
+    const projects: Project[] = [];
+    for (const name of entries) {
+      try {
+        projects.push(await this.load(name));
+      } catch (err) {
+        if (
+          err instanceof ProjectStoreError &&
+          (err.code === "PROJECT_NOT_FOUND" || err.code === "META_CORRUPTED")
+        ) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    projects.sort((a, b) => (a.meta.updatedAt < b.meta.updatedAt ? 1 : -1));
+    return projects;
   }
 
   private toProject(meta: ProjectMeta): Project {
