@@ -39,6 +39,30 @@
       letter-spacing: 1px;
       color: #a0c4ff;
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+    }
+
+    #chat-header-title {
+      flex: 1;
+    }
+
+    .chat-header-link {
+      margin-left: auto;
+      font-size: 12px;
+      font-weight: 400;
+      letter-spacing: 0;
+      color: #888;
+      text-decoration: underline;
+      cursor: pointer;
+      background: transparent;
+      border: none;
+      padding: 4px 6px;
+      font-family: inherit;
+    }
+
+    .chat-header-link:hover {
+      color: #a0c4ff;
     }
 
     #chat-messages {
@@ -242,6 +266,114 @@
       margin: 0;
     }
 
+    /* API キー入力モーダル (T010) */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(13, 13, 26, 0.85);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    .modal-overlay.hidden {
+      display: none;
+    }
+
+    .modal {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      border: 1px solid #2d2d4e;
+      border-radius: 12px;
+      padding: 24px 28px;
+      width: 420px;
+      max-width: calc(100% - 48px);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .modal h2 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 600;
+      color: #a0c4ff;
+    }
+
+    .modal-desc {
+      margin: 0;
+      font-size: 13px;
+      color: #aab1bf;
+      line-height: 1.6;
+    }
+
+    .modal input[type="password"] {
+      width: 100%;
+      background: #0d0d1a;
+      border: 1px solid #2d2d4e;
+      border-radius: 8px;
+      color: #e0e0e0;
+      font-size: 14px;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .modal input[type="password"]:focus {
+      outline: none;
+      border-color: #a0c4ff;
+    }
+
+    .modal-error {
+      font-size: 13px;
+      color: #ff8080;
+      background: #4a1a1a;
+      border-radius: 8px;
+      padding: 8px 12px;
+    }
+
+    .modal-error.hidden {
+      display: none;
+    }
+
+    .modal-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    .btn-primary {
+      background: #a0c4ff;
+      color: #0d0d1a;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .btn-primary:disabled {
+      background: #2d2d4e;
+      color: #555;
+      cursor: not-allowed;
+    }
+
+    .btn-secondary {
+      background: transparent;
+      color: #a0c4ff;
+      border: 1px solid #a0c4ff;
+      border-radius: 8px;
+      padding: 8px 16px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    .btn-secondary:hover {
+      background: rgba(160, 196, 255, 0.1);
+    }
+
     @media (prefers-color-scheme: light) {
       html, body { background: #f0f4f8; color: #1a1a2e; }
       #chat-pane { background: #ffffff; border-right-color: #ddd; }
@@ -260,7 +392,12 @@
 <body>
   <div id="app">
     <div id="chat-pane">
-      <div id="chat-header">sl<span style="color:#ff6b6b">AI</span>do</div>
+      <div id="chat-header">
+        <span id="chat-header-title">sl<span style="color:#ff6b6b">AI</span>do</span>
+        <button id="api-key-reset-link" class="chat-header-link" type="button">
+          API キーを再設定
+        </button>
+      </div>
 
       <div id="chat-messages">
         <div class="message assistant">こんにちは！スライドを作成するドキュメントやアウトラインを下の入力欄に貼り付けてください。</div>
@@ -287,6 +424,26 @@
         <p>スライドを生成するとここにプレビューが表示されます</p>
       </div>
       <iframe id="preview-iframe" style="display:none;" sandbox="allow-scripts allow-same-origin"></iframe>
+    </div>
+  </div>
+
+  <div id="api-key-modal" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="api-key-modal-title">
+      <h2 id="api-key-modal-title">OpenRouter API キーを入力</h2>
+      <p class="modal-desc">
+        slAIdo は OpenRouter 経由で LLM を呼び出します。
+        お持ちでない場合は下のボタンから取得できます。
+      </p>
+      <input id="api-key-input" type="password" autocomplete="off" placeholder="sk-or-v1-..." />
+      <div id="api-key-error" class="modal-error hidden"></div>
+      <div class="modal-actions">
+        <button id="api-key-signup-btn" class="btn-secondary" type="button">
+          OpenRouter にサインアップ
+        </button>
+        <button id="api-key-submit-btn" class="btn-primary" type="button" disabled>
+          保存して続行
+        </button>
+      </div>
     </div>
   </div>
 
