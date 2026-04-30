@@ -101,6 +101,251 @@
       align-self: stretch;
     }
 
+    /* T013: assistant メッセージ内の block 群 */
+    .message.assistant {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .block-text {
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+
+    details.block-reasoning {
+      border-left: 2px solid transparent;
+      padding-left: 6px;
+      transition: border-color 0.15s;
+    }
+
+    details.block-reasoning[open] {
+      border-left-color: #a0c4ff;
+    }
+
+    details.block-reasoning > summary {
+      cursor: pointer;
+      color: #888;
+      font-size: 12px;
+      list-style: none;
+      user-select: none;
+    }
+
+    details.block-reasoning > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    details.block-reasoning > summary::before {
+      content: "▸ ";
+      display: inline-block;
+      transition: transform 0.15s;
+    }
+
+    details.block-reasoning[open] > summary::before {
+      content: "▾ ";
+    }
+
+    details.block-reasoning > .reasoning-text {
+      margin-top: 4px;
+      padding: 6px 8px;
+      background: rgba(160, 196, 255, 0.06);
+      border-radius: 4px;
+      font-size: 13px;
+      white-space: pre-wrap;
+      color: #aab1bf;
+    }
+
+    .block-tool-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.04);
+      font-size: 13px;
+      color: #aab1bf;
+    }
+
+    .block-tool-status[data-state="running"]::before,
+    .block-tool-status[data-state="pending"]::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border: 2px solid #888;
+      border-top-color: #a0c4ff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    .block-tool-status[data-state="completed"] {
+      color: #7fc97f;
+      transition: opacity 0.3s 1.5s;
+      opacity: 0.65;
+    }
+
+    .block-tool-status[data-state="completed"]::before {
+      content: "✓";
+      font-weight: 700;
+    }
+
+    .block-tool-status[data-state="error"] {
+      color: #ff8080;
+      background: rgba(255, 128, 128, 0.08);
+    }
+
+    .block-tool-status[data-state="error"]::before {
+      content: "✗";
+      font-weight: 700;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .permission-prompt {
+      background: #3a2a14;
+      border: 1px solid #ffd166;
+      color: #ffe2a8;
+      padding: 10px 12px;
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-size: 13px;
+    }
+
+    .permission-prompt[data-status="user-allowed"],
+    .permission-prompt[data-status="user-denied"] {
+      opacity: 0.45;
+    }
+
+    .permission-prompt-actions {
+      display: flex;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+
+    .permission-prompt button {
+      padding: 4px 12px;
+      border-radius: 6px;
+      border: 1px solid #ffd166;
+      background: transparent;
+      color: #ffe2a8;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .permission-prompt button[data-action="allow"] {
+      background: #ffd166;
+      color: #1a1a2e;
+    }
+
+    .permission-prompt button:disabled {
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+
+    .auto-permission-log {
+      font-size: 11px;
+      color: #777;
+      padding: 2px 8px;
+    }
+
+    .retry-btn {
+      margin-left: 8px;
+      padding: 2px 10px;
+      font-size: 12px;
+      border-radius: 6px;
+      border: 1px solid #ff8080;
+      background: transparent;
+      color: #ff8080;
+      cursor: pointer;
+    }
+
+    /* シードモード / チャットモード切替 (R-1) */
+    body[data-seed-mode="loading"] #seed-area,
+    body[data-seed-mode="loading"] #chat-input-area {
+      display: none;
+    }
+
+    body[data-seed-mode="seed"] #chat-input-area {
+      display: none;
+    }
+
+    body[data-seed-mode="chat"] #seed-area {
+      display: none;
+    }
+
+    /* dev トグル */
+    #dev-raw-trail {
+      border-top: 1px dashed #2d2d4e;
+      padding: 8px 12px;
+      max-height: 220px;
+      overflow-y: auto;
+      background: rgba(0, 0, 0, 0.25);
+    }
+
+    #dev-raw-trail-title {
+      font-size: 11px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+
+    #dev-raw-trail details {
+      font-size: 11px;
+      color: #888;
+      margin-bottom: 2px;
+    }
+
+    #dev-raw-trail pre {
+      margin: 4px 0 0 12px;
+      padding: 4px;
+      font-size: 10px;
+      background: rgba(0, 0, 0, 0.4);
+      border-radius: 4px;
+      max-height: 180px;
+      overflow: auto;
+    }
+
+    #dev-indicator {
+      font-size: 10px;
+      color: #ffd166;
+      border: 1px solid #ffd166;
+      border-radius: 3px;
+      padding: 1px 5px;
+      margin-left: 8px;
+    }
+
+    body:not([data-dev="1"]) #dev-raw-trail,
+    body:not([data-dev="1"]) #dev-indicator {
+      display: none;
+    }
+
+    /* abort ボタン */
+    #abort-btn {
+      padding: 8px 16px;
+      background: #4a1a1a;
+      color: #ff8080;
+      border: 1px solid #ff8080;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.15s;
+      flex-shrink: 0;
+    }
+
+    #abort-btn:hover {
+      background: #6a2424;
+    }
+
+    #abort-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
     #seed-area {
       padding: 12px 16px;
       border-top: 1px solid #2d2d4e;
@@ -414,6 +659,11 @@
       #preview-pane { background: #e8edf2; }
       #preview-header { border-color: #ddd; color: #888; }
       #preview-empty h1 { color: #ccd5e0; }
+      .block-tool-status { background: rgba(0, 0, 0, 0.04); color: #555; }
+      details.block-reasoning > .reasoning-text { background: rgba(74, 144, 217, 0.08); color: #555; }
+      .permission-prompt { background: #fff7e0; color: #5a3d0e; border-color: #d99e2b; }
+      .permission-prompt button { color: #5a3d0e; border-color: #d99e2b; }
+      .permission-prompt button[data-action="allow"] { background: #ffd166; color: #1a1a2e; }
     }
   </style>
 </head>
@@ -422,13 +672,17 @@
     <div id="chat-pane">
       <div id="chat-header">
         <span id="chat-header-title">sl<span style="color:#ff6b6b">AI</span>do</span>
+        <span id="dev-indicator">DEV</span>
         <button id="api-key-reset-link" class="chat-header-link" type="button">
           API キーを再設定
         </button>
       </div>
 
-      <div id="chat-messages">
-        <div class="message assistant">こんにちは！スライドを作成するドキュメントやアウトラインを下の入力欄に貼り付けてください。</div>
+      <div id="chat-messages"></div>
+
+      <div id="dev-raw-trail">
+        <div id="dev-raw-trail-title">RAW EVENTS</div>
+        <div id="dev-raw-trail-list"></div>
       </div>
 
       <div id="seed-area">
@@ -438,8 +692,9 @@
       </div>
 
       <div id="chat-input-area">
-        <textarea id="chat-input" placeholder="修正を指示... (Enter で送信)"></textarea>
+        <textarea id="chat-input" placeholder="修正を指示... (Enter で送信、Shift+Enter で改行)"></textarea>
         <button id="send-btn">送信</button>
+        <button id="abort-btn" type="button" hidden>中断</button>
       </div>
     </div>
 

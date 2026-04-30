@@ -1,32 +1,23 @@
 /**
  * WebView レンダラー
  *
- * チャット UI の操作とメインプロセスとの通信を管理する。
- * メインプロセスへのメッセージ送信は __electrobunSendToHost() を使用する。
+ * チャット UI の操作とメインプロセスとの通信を管理する.
+ * pure 状態遷移は `state.ts` の reducer に委譲し、ここでは IPC と DOM 反映のみ扱う.
+ *
+ * メインプロセスへのメッセージ送信は __electrobunSendToHost() を使用する.
  */
 
 declare function __electrobunSendToHost(data: unknown): void;
 
-type ChatEventMin =
-  | {
-      type: "text-chunk";
-      sessionId: string;
-      messageId: string;
-      partId: string;
-      text: string;
-      delta?: string;
-    }
-  | {
-      type: "reasoning-chunk";
-      sessionId: string;
-      messageId: string;
-      partId: string;
-      text: string;
-      delta?: string;
-    }
-  | { type: "step-finish"; sessionId: string; messageId: string }
-  | { type: "error"; sessionId?: string; reason: string }
-  | { type: string; [k: string]: unknown };
+import type { ChatEvent } from "../bun/opencode";
+import {
+  initialState,
+  reduce,
+  type Action,
+  type ChatLogState,
+  type MessageNode,
+  type PermissionPrompt,
+} from "./state";
 
 type ApiKeyErrorReason =
   | "unauthorized"
@@ -53,7 +44,8 @@ type ServerMessage =
   | { type: "slides"; html: string }
   | { type: "open-slides"; url: string }
   | { type: "error"; message: string }
-  | { type: "chat-event"; event: ChatEventMin }
+  | { type: "chat-event"; event: ChatEvent }
+  | { type: "project-mode"; mode: "seed" | "chat" }
   | { type: "request-api-key" }
   | { type: "api-key-validated" }
   | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string }
@@ -62,6 +54,7 @@ type ServerMessage =
 declare global {
   interface Window {
     __SLAIDO_RECEIVE__: (msg: ServerMessage) => void;
+    __SLAIDO_DEV__?: boolean;
   }
 }
 
@@ -70,9 +63,11 @@ const seedInput = document.getElementById("seed-input") as HTMLTextAreaElement;
 const generateBtn = document.getElementById("generate-btn") as HTMLButtonElement;
 const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement;
 const sendBtn = document.getElementById("send-btn") as HTMLButtonElement;
+const abortBtn = document.getElementById("abort-btn") as HTMLButtonElement;
 const previewIframe = document.getElementById("preview-iframe") as HTMLIFrameElement;
 const previewEmpty = document.getElementById("preview-empty") as HTMLDivElement;
 const previewStatus = document.getElementById("preview-status") as HTMLSpanElement;
+const devRawTrailList = document.getElementById("dev-raw-trail-list") as HTMLDivElement;
 
 const apiKeyModal = document.getElementById("api-key-modal") as HTMLDivElement;
 const apiKeyInput = document.getElementById("api-key-input") as HTMLInputElement;
@@ -99,37 +94,335 @@ function setExportRunning(kind: ExportKind, running: boolean): void {
   btn.textContent = running ? EXPORT_LABELS[kind].running : EXPORT_LABELS[kind].idle;
 }
 
-let isGenerating = false;
+let state: ChatLogState = initialState();
+let pendingFrame = false;
+let dirty = true;
+let lastRenderedRawCount = 0;
 
-/**
- * チャットメッセージを表示する。
- */
-function appendMessage(role: "user" | "assistant" | "error", content: string): void {
-  const div = document.createElement("div");
-  div.className = `message ${role}`;
-  div.textContent = content;
-  chatMessages.appendChild(div);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+function dispatch(action: Action): void {
+  state = reduce(state, action);
+  scheduleRender();
 }
 
-// T009 暫定: text-chunk の messageId 単位でアシスタント DOM を 1 つだけ作り、
-// 累積テキストを差し替える (T013 で本格 mapping に置換)
-const assistantMessageNodes = new Map<string, HTMLDivElement>();
+function scheduleRender(): void {
+  dirty = true;
+  if (pendingFrame) return;
+  pendingFrame = true;
+  requestAnimationFrame(() => {
+    pendingFrame = false;
+    if (!dirty) return;
+    dirty = false;
+    render();
+  });
+}
 
-function applyTextChunk(messageId: string, text: string, role: "assistant"): void {
-  let div = assistantMessageNodes.get(messageId);
-  if (!div) {
-    div = document.createElement("div");
-    div.className = `message ${role}`;
-    chatMessages.appendChild(div);
-    assistantMessageNodes.set(messageId, div);
+function render(): void {
+  applySeedModeClass();
+  renderMessages();
+  renderInputArea();
+  if (isDevMode()) {
+    renderDevRawTrail();
   }
-  div.textContent = text;
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function applySeedModeClass(): void {
+  const mode =
+    state.seedMode === null ? "loading" : state.seedMode ? "seed" : "chat";
+  document.body.dataset["seedMode"] = mode;
+}
+
+function renderInputArea(): void {
+  if (state.turn === "running") {
+    sendBtn.hidden = true;
+    abortBtn.hidden = false;
+    abortBtn.disabled = false;
+    abortBtn.textContent = "中断";
+    chatInput.disabled = true;
+    generateBtn.disabled = true;
+  } else if (state.turn === "aborting") {
+    sendBtn.hidden = true;
+    abortBtn.hidden = false;
+    abortBtn.disabled = true;
+    abortBtn.textContent = "中断中…";
+    chatInput.disabled = true;
+    generateBtn.disabled = true;
+  } else {
+    sendBtn.hidden = false;
+    abortBtn.hidden = true;
+    chatInput.disabled = false;
+    generateBtn.disabled = false;
+    sendBtn.textContent = "送信";
+    generateBtn.textContent = "スライドを生成";
+  }
 }
 
 /**
- * スライドプレビューを srcdoc で更新する（旧経路。T012 で chokidar に倒れた場合の予備）。
+ * 既存 DOM と state.messages を比較し、差分のみ更新する.
+ * `<details>` の開閉状態を保つため innerHTML 一括置換は使わない.
+ */
+function renderMessages(): void {
+  const seenIds = new Set<string>();
+
+  const renderTargets: Array<{ id: string; node: MessageNode | null; permission: PermissionPrompt | null }> = [];
+  for (const msg of state.messages) {
+    renderTargets.push({ id: `msg:${msg.id}`, node: msg, permission: null });
+  }
+  for (const perm of state.permissions) {
+    renderTargets.push({ id: `perm:${perm.permissionId}`, node: null, permission: perm });
+  }
+
+  // 既存の child を id でインデックス化
+  const existingNodes = new Map<string, HTMLElement>();
+  for (const child of Array.from(chatMessages.children)) {
+    if (child instanceof HTMLElement) {
+      const id = child.dataset["entryId"];
+      if (id) existingNodes.set(id, child);
+    }
+  }
+
+  for (const target of renderTargets) {
+    seenIds.add(target.id);
+    let el = existingNodes.get(target.id);
+    if (!el) {
+      el = document.createElement("div");
+      el.dataset["entryId"] = target.id;
+      chatMessages.appendChild(el);
+    }
+    if (target.node) {
+      renderMessageNode(el, target.node);
+    } else if (target.permission) {
+      renderPermissionPrompt(el, target.permission);
+    }
+  }
+
+  // 余剰 node を削除
+  for (const [id, el] of existingNodes) {
+    if (!seenIds.has(id)) {
+      el.remove();
+    }
+  }
+
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function renderMessageNode(el: HTMLElement, msg: MessageNode): void {
+  el.className = `message ${msg.role}`;
+  // 既存ブロックを id でインデックス化
+  const existingBlocks = new Map<string, HTMLElement>();
+  for (const child of Array.from(el.children)) {
+    if (child instanceof HTMLElement) {
+      const id = child.dataset["blockId"];
+      if (id) existingBlocks.set(id, child);
+    }
+  }
+
+  if (msg.role === "user") {
+    el.textContent = "";
+    const text = msg.blocks
+      .map((b) => (b.kind === "text" ? b.text : ""))
+      .join("");
+    el.textContent = text;
+    return;
+  }
+
+  if (msg.role === "error") {
+    const text = msg.blocks
+      .map((b) => (b.kind === "text" ? b.text : ""))
+      .join("");
+    el.textContent = text;
+    if (!el.querySelector(".retry-btn")) {
+      const btn = document.createElement("button");
+      btn.className = "retry-btn";
+      btn.type = "button";
+      btn.textContent = "再試行";
+      btn.addEventListener("click", () => {
+        dispatch({ type: "retry-last" });
+        const text = state.lastUserInput;
+        if (text !== null && text !== "") {
+          __electrobunSendToHost({ type: "chat", content: text });
+        }
+      });
+      el.appendChild(btn);
+    }
+    return;
+  }
+
+  // assistant: blocks を順序通りに反映
+  const seenBlocks = new Set<string>();
+  let prev: HTMLElement | null = null;
+  for (const block of msg.blocks) {
+    let blockId: string;
+    if (block.kind === "text") blockId = `text:${block.partId}`;
+    else if (block.kind === "reasoning") blockId = `reasoning:${block.partId}`;
+    else blockId = `tool:${block.callId}`;
+    seenBlocks.add(blockId);
+
+    let blockEl = existingBlocks.get(blockId);
+    if (!blockEl) {
+      blockEl = document.createElement("div");
+      blockEl.dataset["blockId"] = blockId;
+    }
+    if (block.kind === "text") {
+      if (blockEl.tagName !== "DIV") {
+        const replacement = document.createElement("div");
+        replacement.dataset["blockId"] = blockId;
+        blockEl.replaceWith(replacement);
+        blockEl = replacement;
+      }
+      blockEl.className = "block-text";
+      blockEl.textContent = block.text;
+    } else if (block.kind === "reasoning") {
+      if (blockEl.tagName !== "DETAILS") {
+        const replacement = document.createElement("details");
+        replacement.dataset["blockId"] = blockId;
+        // 初回作成時のみ open 属性を確定 (それ以降はユーザー操作を尊重)
+        if (!block.collapsed) replacement.open = true;
+        blockEl.replaceWith(replacement);
+        blockEl = replacement;
+      }
+      blockEl.className = "block-reasoning";
+      let summary = blockEl.querySelector("summary");
+      if (!summary) {
+        summary = document.createElement("summary");
+        summary.textContent = "思考";
+        blockEl.appendChild(summary);
+      }
+      let textEl = blockEl.querySelector(".reasoning-text") as HTMLDivElement | null;
+      if (!textEl) {
+        textEl = document.createElement("div");
+        textEl.className = "reasoning-text";
+        blockEl.appendChild(textEl);
+      }
+      textEl.textContent = block.text;
+    } else {
+      if (blockEl.tagName !== "DIV") {
+        const replacement = document.createElement("div");
+        replacement.dataset["blockId"] = blockId;
+        blockEl.replaceWith(replacement);
+        blockEl = replacement;
+      }
+      blockEl.className = "block-tool-status";
+      blockEl.dataset["state"] = block.state;
+      blockEl.setAttribute("role", "status");
+      blockEl.textContent =
+        block.state === "completed" ? `${block.label} (完了)` : block.label;
+    }
+
+    // 順序: prev の直後に挿入
+    if (prev) {
+      if (prev.nextElementSibling !== blockEl) {
+        prev.insertAdjacentElement("afterend", blockEl);
+      }
+    } else {
+      if (el.firstElementChild !== blockEl) {
+        el.insertBefore(blockEl, el.firstElementChild);
+      }
+    }
+    prev = blockEl;
+  }
+
+  // 余剰 block を削除
+  for (const [id, blockEl] of existingBlocks) {
+    if (!seenBlocks.has(id)) blockEl.remove();
+  }
+}
+
+function renderPermissionPrompt(el: HTMLElement, prompt: PermissionPrompt): void {
+  el.className = "permission-prompt";
+  el.dataset["status"] = prompt.status;
+  el.dataset["permissionId"] = prompt.permissionId;
+
+  if (prompt.status === "auto-allowed") {
+    el.className = "auto-permission-log";
+    el.textContent = `[自動許可] ${prompt.kind}: ${prompt.title}`;
+    return;
+  }
+
+  // pending / user-allowed / user-denied は同じ DOM 構造で出す
+  let title = el.querySelector(".permission-prompt-title") as HTMLDivElement | null;
+  if (!title) {
+    title = document.createElement("div");
+    title.className = "permission-prompt-title";
+    el.appendChild(title);
+  }
+  title.textContent =
+    prompt.status === "user-allowed"
+      ? `[許可済み] ${prompt.title}`
+      : prompt.status === "user-denied"
+        ? `[拒否済み] ${prompt.title}`
+        : `${prompt.title} を実行してもよいですか？`;
+
+  let actions = el.querySelector(".permission-prompt-actions") as HTMLDivElement | null;
+  if (!actions) {
+    actions = document.createElement("div");
+    actions.className = "permission-prompt-actions";
+    const allow = document.createElement("button");
+    allow.dataset["action"] = "allow";
+    allow.type = "button";
+    allow.textContent = "許可";
+    allow.addEventListener("click", () => {
+      const id = el.dataset["permissionId"];
+      if (id) dispatch({ type: "permission-decide", permissionId: id, allow: true });
+    });
+    const deny = document.createElement("button");
+    deny.dataset["action"] = "deny";
+    deny.type = "button";
+    deny.textContent = "拒否";
+    deny.addEventListener("click", () => {
+      const id = el.dataset["permissionId"];
+      if (id) dispatch({ type: "permission-decide", permissionId: id, allow: false });
+    });
+    actions.appendChild(allow);
+    actions.appendChild(deny);
+    el.appendChild(actions);
+  }
+  // ボタンの活性は status で切替
+  const buttons = actions.querySelectorAll<HTMLButtonElement>("button");
+  buttons.forEach((btn) => {
+    btn.disabled = prompt.status !== "pending";
+  });
+}
+
+function renderDevRawTrail(): void {
+  if (!devRawTrailList) return;
+  // 増分のみ追加 (rawTrail は append-only)
+  for (let i = lastRenderedRawCount; i < state.rawTrail.length; i++) {
+    const ev = state.rawTrail[i];
+    if (!ev) continue;
+    const det = document.createElement("details");
+    const sum = document.createElement("summary");
+    sum.textContent = ev.type;
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(ev, null, 2);
+    det.appendChild(sum);
+    det.appendChild(pre);
+    devRawTrailList.appendChild(det);
+  }
+  lastRenderedRawCount = state.rawTrail.length;
+}
+
+/**
+ * 開発モード判定 (R-4): クエリ + localStorage + window グローバルの OR.
+ * `import.meta.env.DEV` は Electrobun の views ビルド系で通るか未確認のため採用見送り.
+ */
+function isDevMode(): boolean {
+  try {
+    if (window.__SLAIDO_DEV__ === true) return true;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("dev") === "1") return true;
+    if (window.localStorage?.getItem("slaido_dev") === "1") return true;
+  } catch {
+    // ignore (sandbox 等)
+  }
+  return false;
+}
+
+function applyDevModeAttribute(): void {
+  document.body.dataset["dev"] = isDevMode() ? "1" : "0";
+}
+
+/**
+ * スライドプレビューを srcdoc で更新する（旧経路。T012 で chokidar に倒れた場合の予備）.
  */
 function updatePreview(html: string): void {
   previewEmpty.style.display = "none";
@@ -139,9 +432,6 @@ function updatePreview(html: string): void {
   previewStatus.textContent = "生成済み";
 }
 
-/**
- * スライドプレビューを file:// or http:// URL で更新する。
- */
 function openSlidesUrl(url: string): void {
   previewEmpty.style.display = "none";
   previewIframe.style.display = "block";
@@ -150,21 +440,15 @@ function openSlidesUrl(url: string): void {
   previewStatus.textContent = "テンプレ表示中";
 }
 
-/**
- * 入力値が API キーとして妥当かを判定する (main 側 zod と同条件、plan F5).
- */
 function isValidApiKeyInput(value: string): boolean {
   return value.length >= 20 && value.startsWith("sk-or-");
 }
 
-/**
- * モーダル表示中はチャット入力を無効化する。
- */
-function setChatDisabled(disabled: boolean): void {
+function setChatInputsDisabled(disabled: boolean): void {
   seedInput.disabled = disabled;
   chatInput.disabled = disabled;
-  generateBtn.disabled = disabled || isGenerating;
-  sendBtn.disabled = disabled || isGenerating;
+  generateBtn.disabled = disabled;
+  sendBtn.disabled = disabled;
 }
 
 function showApiKeyModal(): void {
@@ -174,8 +458,7 @@ function showApiKeyModal(): void {
   apiKeyError.textContent = "";
   apiKeyInput.value = "";
   apiKeySubmitBtn.disabled = true;
-  setChatDisabled(true);
-  // 表示直後にフォーカス
+  setChatInputsDisabled(true);
   setTimeout(() => apiKeyInput.focus(), 0);
 }
 
@@ -185,7 +468,9 @@ function hideApiKeyModal(): void {
   apiKeyError.classList.add("hidden");
   apiKeyError.textContent = "";
   apiKeyInput.value = "";
-  setChatDisabled(false);
+  setChatInputsDisabled(false);
+  // turn 状態に応じて再描画
+  scheduleRender();
 }
 
 function showApiKeyError(reason: ApiKeyErrorReason, message?: string): void {
@@ -205,16 +490,7 @@ function showApiKeyError(reason: ApiKeyErrorReason, message?: string): void {
   apiKeyInput.select();
 }
 
-/**
- * メインプロセスからのメッセージを受信する。
- */
 window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
-  if (msg.type === "message") {
-    appendMessage("assistant", msg.content);
-    setGenerating(false);
-    return;
-  }
-
   if (msg.type === "slides") {
     updatePreview(msg.html);
     return;
@@ -225,31 +501,46 @@ window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
     return;
   }
 
+  if (msg.type === "project-mode") {
+    dispatch({ type: "set-seed-mode", mode: msg.mode });
+    return;
+  }
+
+  if (msg.type === "message") {
+    // legacy: appendMessage 経路は最低限のメッセージのみ
+    const node: MessageNode = {
+      id: `legacy-${Date.now()}`,
+      role: "assistant",
+      blocks: [{ kind: "text", partId: "legacy", text: msg.content }],
+      createdAt: Date.now(),
+    };
+    state = {
+      ...state,
+      messages: [...state.messages, node],
+      turn: "idle",
+    };
+    scheduleRender();
+    return;
+  }
+
   if (msg.type === "error") {
-    appendMessage("error", msg.message);
-    setGenerating(false);
+    const node: MessageNode = {
+      id: `legacy-err-${Date.now()}`,
+      role: "error",
+      blocks: [{ kind: "text", partId: "legacy", text: msg.message }],
+      createdAt: Date.now(),
+    };
+    state = {
+      ...state,
+      messages: [...state.messages, node],
+      turn: "idle",
+    };
+    scheduleRender();
     return;
   }
 
   if (msg.type === "chat-event") {
-    const ev = msg.event;
-    if (ev.type === "text-chunk") {
-      const text = (ev as { text?: string }).text ?? "";
-      const messageId = (ev as { messageId?: string }).messageId ?? "default";
-      applyTextChunk(messageId, text, "assistant");
-      return;
-    }
-    if (ev.type === "step-finish") {
-      setGenerating(false);
-      return;
-    }
-    if (ev.type === "error") {
-      const reason = (ev as { reason?: string }).reason ?? "unknown";
-      appendMessage("error", `[chat-event:error] ${reason}`);
-      setGenerating(false);
-      return;
-    }
-    // raw / reasoning-chunk / tool-status / permission-request は T013 で UI 化
+    dispatch({ type: "chat-event", event: msg.event });
     return;
   }
 
@@ -279,26 +570,30 @@ function handleExportProgress(msg: ExportProgressMessage): void {
     setExportRunning(msg.kind, true);
     return;
   }
-  // done / error / canceled いずれもボタンは復帰
   setExportRunning(msg.kind, false);
   if (msg.phase === "error" && !msg.silent && msg.message) {
-    appendMessage("error", `[export:${msg.kind}] ${msg.message}`);
+    const node: MessageNode = {
+      id: `legacy-err-export-${Date.now()}`,
+      role: "error",
+      blocks: [
+        { kind: "text", partId: "legacy", text: `[export:${msg.kind}] ${msg.message}` },
+      ],
+      createdAt: Date.now(),
+    };
+    state = {
+      ...state,
+      messages: [...state.messages, node],
+    };
+    scheduleRender();
   }
 }
 
-function setGenerating(value: boolean): void {
-  isGenerating = value;
-  generateBtn.disabled = value;
-  sendBtn.disabled = value;
-  generateBtn.textContent = value ? "生成中..." : "スライドを生成";
-}
 
 generateBtn.addEventListener("click", () => {
   const seedContent = seedInput.value.trim();
-  if (!seedContent || isGenerating) return;
+  if (!seedContent || state.turn !== "idle") return;
 
-  appendMessage("user", `[ドキュメントからスライドを生成]`);
-  setGenerating(true);
+  dispatch({ type: "seed-generate", seed: seedContent });
   previewStatus.textContent = "生成中...";
 
   __electrobunSendToHost({ type: "generate", seedContent });
@@ -306,6 +601,12 @@ generateBtn.addEventListener("click", () => {
 
 sendBtn.addEventListener("click", () => {
   sendChatMessage();
+});
+
+abortBtn.addEventListener("click", () => {
+  if (state.turn !== "running") return;
+  dispatch({ type: "abort-requested" });
+  __electrobunSendToHost({ type: "chat-cancel" });
 });
 
 chatInput.addEventListener("keydown", (e: KeyboardEvent) => {
@@ -317,16 +618,14 @@ chatInput.addEventListener("keydown", (e: KeyboardEvent) => {
 
 function sendChatMessage(): void {
   const content = chatInput.value.trim();
-  if (!content || isGenerating) return;
+  if (!content || state.turn !== "idle") return;
 
-  appendMessage("user", content);
+  dispatch({ type: "user-send", text: content });
   chatInput.value = "";
-  setGenerating(true);
 
   __electrobunSendToHost({ type: "chat", content });
 }
 
-// API キーモーダルの結線
 apiKeyInput.addEventListener("input", () => {
   const value = apiKeyInput.value.trim();
   apiKeySubmitBtn.disabled = !isValidApiKeyInput(value);
@@ -377,8 +676,9 @@ exportHtmlZipBtn.addEventListener("click", () => {
   __electrobunSendToHost({ type: "export-html-zip" });
 });
 
-// メインプロセスに準備完了を通知
+applyDevModeAttribute();
+scheduleRender();
+
 __electrobunSendToHost({ type: "ready" });
 
-// このファイルをモジュールとして扱わせ、`declare global` を有効化する。
 export {};

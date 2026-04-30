@@ -53,6 +53,7 @@ import {
 const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ready") }),
   z.object({ type: z.literal("chat"), content: z.string() }),
+  z.object({ type: z.literal("chat-cancel") }),
   z.object({ type: z.literal("generate"), seedContent: z.string() }),
   z.object({
     type: z.literal("submit-api-key"),
@@ -80,6 +81,7 @@ type ServerMessage =
   | { type: "open-slides"; url: string }
   | { type: "error"; message: string }
   | { type: "chat-event"; event: ChatEvent }
+  | { type: "project-mode"; mode: "seed" | "chat" }
   | { type: "request-api-key" }
   | { type: "api-key-validated" }
   | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string }
@@ -262,6 +264,15 @@ function attachHandlers(
         return;
       }
 
+      if (msg.type === "chat-cancel") {
+        const bridge = getActiveBridge();
+        const session = getActiveSession();
+        if (bridge && session) {
+          void bridge.abort(session.sessionId);
+        }
+        return;
+      }
+
       if (msg.type === "submit-api-key") {
         void apiKeyHandlers.onSubmitApiKey(msg.key);
         return;
@@ -326,6 +337,17 @@ function attachHandlers(
   });
 }
 
+async function determineProjectMode(project: Project): Promise<"seed" | "chat"> {
+  try {
+    const seedPath = join(project.cwd, "seed", "input.md");
+    const content = await readFile(seedPath, "utf8");
+    return content.trim() === "" ? "seed" : "chat";
+  } catch {
+    // seed/input.md が無いケースは seed mode (新規 / 旧プロジェクト)
+    return "seed";
+  }
+}
+
 async function bootstrap(): Promise<void> {
   const projectsRoot = getProjectsRoot();
   const templateRoot = getBundledTemplateRoot();
@@ -338,6 +360,7 @@ async function bootstrap(): Promise<void> {
   let activeBridge: ChatBridge | null = null;
   let activeSession: { sessionId: string } | null = null;
   let activePreviewSync: PreviewSync | null = null;
+  let projectModeSent = false;
   const keychain = new KeychainAdapter();
 
   const win = new BrowserWindow({
@@ -346,16 +369,30 @@ async function bootstrap(): Promise<void> {
     url: "views://mainview/index.html",
   });
 
+  /**
+   * R-1: open-slides を送る前に project-mode を一度だけ flush する.
+   * WebView 側 reducer の seedMode は project-mode 受信まで null = ローディング状態.
+   */
+  async function flushProjectModeAndOpen(): Promise<void> {
+    if (!activeProject) return;
+    if (!projectModeSent) {
+      projectModeSent = true;
+      const mode = await determineProjectMode(activeProject);
+      sendToWebView(win, { type: "project-mode", mode });
+    }
+    const url = pathToFileURL(activeProject.slidesEntry).href;
+    sendToWebView(win, { type: "open-slides", url });
+  }
+
   bootstrapProject(store)
-    .then((project) => {
+    .then(async (project) => {
       activeProject = project;
       console.log(
         `[slAIdo] active project ${project.meta.id} title="${project.meta.title}" cwd=${project.cwd}`,
       );
       // 既に opencode が立ち上がっている場合、遅れてやってきた project を反映
       if (activeManager) {
-        const url = pathToFileURL(project.slidesEntry).href;
-        sendToWebView(win, { type: "open-slides", url });
+        await flushProjectModeAndOpen();
       }
     })
     .catch((err) => {
@@ -575,8 +612,7 @@ async function bootstrap(): Promise<void> {
         }
         const ok = await startManagerWithKey(key, true);
         if (ok && activeProject) {
-          const url = pathToFileURL(activeProject.slidesEntry).href;
-          sendToWebView(win, { type: "open-slides", url });
+          await flushProjectModeAndOpen();
         }
       },
       onResetApiKey: async () => {
@@ -629,8 +665,7 @@ async function bootstrap(): Promise<void> {
     }
 
     if (activeProject) {
-      const url = pathToFileURL(activeProject.slidesEntry).href;
-      sendToWebView(win, { type: "open-slides", url });
+      await flushProjectModeAndOpen();
     }
   });
 
