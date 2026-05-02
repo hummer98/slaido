@@ -19,7 +19,15 @@
     #app {
       display: grid;
       grid-template-columns: 360px 1fr;
+      grid-template-rows: 100vh;
       height: 100vh;
+      overflow: hidden;
+    }
+
+    /* grid 子要素の min-content 暗黙制約で row が膨張するのを防ぐ */
+    #chat-pane, #preview-pane {
+      min-height: 0;
+      min-width: 0;
       overflow: hidden;
     }
 
@@ -509,10 +517,12 @@
     }
 
     #preview-iframe {
-      flex: 1;
+      flex: 1 1 auto;
       width: 100%;
+      min-height: 0; /* flex item の auto min-height で iframe が content 高さに膨らむのを防ぐ */
+      height: 100%;
       border: none;
-      background: #fff;
+      background: #191919;
     }
 
     #preview-empty {
@@ -710,7 +720,7 @@
         <h1>slAIdo</h1>
         <p>スライドを生成するとここにプレビューが表示されます</p>
       </div>
-      <iframe id="preview-iframe" style="display:none;" sandbox="allow-scripts allow-same-origin"></iframe>
+      <iframe id="preview-iframe" style="display:none;" sandbox="allow-scripts allow-same-origin allow-popups allow-forms"></iframe>
     </div>
   </div>
 

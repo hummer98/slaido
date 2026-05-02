@@ -12,7 +12,8 @@
     "build:dev": "bun install && bun run fetchOpencode && ./node_modules/.bin/electrobun build",
     "build:prod": "bun install && bun run fetchOpencode && ./node_modules/.bin/electrobun build --env=stable",
     "fetchOpencode": "bun run scripts/fetch-opencode.ts",
-    "test": "bun test"
+    "test": "bun test src/",
+    "test:e2e": "bun test tests/e2e/ --timeout 600000"
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.14.29",
@@ -22,6 +23,7 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "bun-mot": "file:../bun-mot",
     "typescript": "^5.0.0"
   }
 }

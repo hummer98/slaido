@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ZipFailedError } from "./errors";
+import { warn as logWarn, error as logError, fmtErr } from "../logger";
 
 const ILLEGAL_DIR_CHARS = /[\/:]/g;
 
@@ -90,7 +91,12 @@ async function scrubMacOsArtifacts(root: string): Promise<void> {
   let entries;
   try {
     entries = await readdir(root, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    // ディレクトリ不在は scrub 不要として無視。それ以外は warn を残す。
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") {
+      void logWarn("scrub_macos_readdir_failed", `root=${root} ${fmtErr(err)}`);
+    }
     return;
   }
   for (const ent of entries) {
@@ -148,8 +154,13 @@ export async function exportHtmlZip(
 ): Promise<void> {
   const spawnZip = deps.spawnZip ?? defaultSpawnZip;
 
-  // 既存出力ファイルを削除 (zip のデフォルトは update なので / Minor m2)
-  await unlink(args.outputPath).catch(() => {});
+  // 既存出力ファイルを削除 (zip のデフォルトは update なので / Minor m2)。
+  // ENOENT 含めてどんな失敗でも次の zip コマンドが結果を上書きするのでログは不要。
+  await unlink(args.outputPath).catch((err: NodeJS.ErrnoException) => {
+    if (err.code !== "ENOENT") {
+      void logWarn("export_html_zip_pre_unlink_failed", `path=${args.outputPath} ${fmtErr(err)}`);
+    }
+  });
 
   const stagingRoot = await mkdtemp(join(tmpdir(), "slaido-export-"));
   try {
@@ -165,15 +176,16 @@ export async function exportHtmlZip(
       const indexPath = join(stagingRoot, rootDirName, "index.html");
       const v = await verifyNoExternalRefs(indexPath);
       if (!v.ok) {
-        console.warn(
-          `[slAIdo] export-html-zip external-refs detected ${JSON.stringify({
+        void logWarn(
+          "export_html_zip_external_refs",
+          JSON.stringify({
             count: v.externalRefs.length,
             samples: v.externalRefs.slice(0, 3),
-          })}`,
+          }),
         );
       }
     } catch (err) {
-      console.warn("[slAIdo] export-html-zip verifyNoExternalRefs failed:", err);
+      void logWarn("export_html_zip_verify_failed", fmtErr(err));
     }
 
     const { exitCode, stderr } = await spawnZip(
@@ -189,7 +201,19 @@ export async function exportHtmlZip(
     );
 
     if (exitCode !== 0) {
-      await unlink(args.outputPath).catch(() => {});
+      void logError(
+        "export_html_zip_command_failed",
+        `exit=${exitCode} stderr=${JSON.stringify(stderr.trim() || "(empty)")} output=${args.outputPath}`,
+      );
+      // 失敗時に部分書き込みファイルを片付ける best-effort。
+      await unlink(args.outputPath).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") {
+          void logWarn(
+            "export_html_zip_post_unlink_failed",
+            `path=${args.outputPath} ${fmtErr(err)}`,
+          );
+        }
+      });
       throw new ZipFailedError(
         `zip failed (exit=${exitCode}): ${stderr.trim() || "(no stderr)"}`,
         exitCode,

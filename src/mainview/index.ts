@@ -9,10 +9,19 @@
 
 declare function __electrobunSendToHost(data: unknown): void;
 
+// E2E ブリッジ用: bun-mot は browser 側で `Electroview` を構築して RPC transport を確立し、
+// builtin の `evaluateJavascriptWithResponse` extraRequestHandler を登録することを前提とする。
+// slaido は通常運用では __electrobunSendToHost のみで成立しているが、bun-mot を動かすにはこの初期化が必要。
+import { Electroview } from "electrobun/view";
+new Electroview({
+  rpc: Electroview.defineRPC({ handlers: { requests: {}, messages: {} } }),
+});
+
 import type { ChatEvent } from "../bun/opencode";
 import {
   initialState,
   reduce,
+  toolLabel,
   type Action,
   type ChatLogState,
   type MessageNode,
@@ -541,6 +550,10 @@ window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
 
   if (msg.type === "chat-event") {
     dispatch({ type: "chat-event", event: msg.event });
+    // ヘッダー (preview-status) にも進行中ツールを表示する。
+    // 長い tool chain (Read → Read → Write …) の最中も「生成中...」固定だと
+    // ユーザは止まっているように見えるので、現在のツールでアップデートする。
+    updatePreviewStatusFromEvent(msg.event);
     return;
   }
 
@@ -564,6 +577,31 @@ window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
     return;
   }
 };
+
+function updatePreviewStatusFromEvent(ev: ChatEvent): void {
+  // turn が running 中だけ更新 (idle 復帰後に古い tool ラベルが残らないように)
+  if (state.turn !== "running") return;
+  if (ev.type === "tool-status") {
+    const status = ev.state.status;
+    if (status === "pending" || status === "running") {
+      previewStatus.textContent = toolLabel(ev.tool, ev.state);
+    } else if (status === "completed") {
+      // 完了は短時間だけ示してから「生成中...」に戻す。次の running イベントで上書きされる。
+      previewStatus.textContent = `${toolLabel(ev.tool, ev.state)} (完了)`;
+    } else if (status === "error") {
+      previewStatus.textContent = `${toolLabel(ev.tool, ev.state)} (失敗)`;
+    }
+    return;
+  }
+  if (ev.type === "step-finish") {
+    previewStatus.textContent = "プレビュー反映中...";
+    return;
+  }
+  if (ev.type === "error") {
+    previewStatus.textContent = "エラー発生";
+    return;
+  }
+}
 
 function handleExportProgress(msg: ExportProgressMessage): void {
   if (msg.phase === "start") {
@@ -591,7 +629,14 @@ function handleExportProgress(msg: ExportProgressMessage): void {
 
 generateBtn.addEventListener("click", () => {
   const seedContent = seedInput.value.trim();
-  if (!seedContent || state.turn !== "idle") return;
+  if (!seedContent || state.turn !== "idle") {
+    __electrobunSendToHost({
+      type: "client-warn",
+      event: "generate_click_ignored",
+      detail: `seedLen=${seedContent.length} turn=${state.turn}`,
+    });
+    return;
+  }
 
   dispatch({ type: "seed-generate", seed: seedContent });
   previewStatus.textContent = "生成中...";
@@ -604,7 +649,14 @@ sendBtn.addEventListener("click", () => {
 });
 
 abortBtn.addEventListener("click", () => {
-  if (state.turn !== "running") return;
+  if (state.turn !== "running") {
+    __electrobunSendToHost({
+      type: "client-warn",
+      event: "abort_click_ignored",
+      detail: `turn=${state.turn}`,
+    });
+    return;
+  }
   dispatch({ type: "abort-requested" });
   __electrobunSendToHost({ type: "chat-cancel" });
 });
@@ -618,7 +670,14 @@ chatInput.addEventListener("keydown", (e: KeyboardEvent) => {
 
 function sendChatMessage(): void {
   const content = chatInput.value.trim();
-  if (!content || state.turn !== "idle") return;
+  if (!content || state.turn !== "idle") {
+    __electrobunSendToHost({
+      type: "client-warn",
+      event: "chat_send_ignored",
+      detail: `contentLen=${content.length} turn=${state.turn}`,
+    });
+    return;
+  }
 
   dispatch({ type: "user-send", text: content });
   chatInput.value = "";
@@ -659,7 +718,14 @@ apiKeyResetLink.addEventListener("click", (ev) => {
 
 function submitApiKey(): void {
   const value = apiKeyInput.value.trim();
-  if (!isValidApiKeyInput(value)) return;
+  if (!isValidApiKeyInput(value)) {
+    __electrobunSendToHost({
+      type: "client-warn",
+      event: "api_key_submit_ignored",
+      detail: `valueLen=${value.length}`,
+    });
+    return;
+  }
   apiKeySubmitBtn.disabled = true;
   apiKeyError.classList.add("hidden");
   apiKeyError.textContent = "";
@@ -667,12 +733,26 @@ function submitApiKey(): void {
 }
 
 exportPdfBtn.addEventListener("click", () => {
-  if (exportPdfBtn.disabled) return;
+  if (exportPdfBtn.disabled) {
+    __electrobunSendToHost({
+      type: "client-warn",
+      event: "export_pdf_click_ignored",
+      detail: "reason=button_disabled",
+    });
+    return;
+  }
   __electrobunSendToHost({ type: "export-pdf" });
 });
 
 exportHtmlZipBtn.addEventListener("click", () => {
-  if (exportHtmlZipBtn.disabled) return;
+  if (exportHtmlZipBtn.disabled) {
+    __electrobunSendToHost({
+      type: "client-warn",
+      event: "export_html_zip_click_ignored",
+      detail: "reason=button_disabled",
+    });
+    return;
+  }
   __electrobunSendToHost({ type: "export-html-zip" });
 });
 

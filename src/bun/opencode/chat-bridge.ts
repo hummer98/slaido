@@ -18,6 +18,7 @@ import {
 
 import { normalizeEvent } from "./types";
 import type { ChatEvent, OpencodeRawEvent } from "./types";
+import { error as logError, fmtErr } from "../logger";
 
 export interface ChatBridgeInitArgs {
   /** OpencodeServerManager.start() が返した baseUrl */
@@ -182,7 +183,7 @@ export class ChatBridge {
       try {
         h(event);
       } catch (err) {
-        console.error("[chat-bridge] handler threw:", err);
+        void logError("chat_bridge_handler_threw", fmtErr(err));
       }
     }
   }
@@ -259,7 +260,7 @@ export class ChatBridge {
       try {
         await this.client.session.abort({ path: { id: sessionId } });
       } catch (err) {
-        console.error("[chat-bridge] session.abort failed:", err);
+        void logError("chat_bridge_session_abort_failed", fmtErr(err));
       }
     }
     this.dispatch({

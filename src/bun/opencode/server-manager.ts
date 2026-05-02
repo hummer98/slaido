@@ -10,7 +10,7 @@
 
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve as joinPath } from "node:path";
 import type { Subprocess } from "bun";
 
@@ -18,6 +18,31 @@ import {
   assertBinaryExists,
   resolveOpencodeBinary,
 } from "./binary-resolver";
+import { log, warn as logWarn, error as logError, fmtErr } from "../logger";
+
+/** ReadableStream から末尾の最大 maxBytes 分を文字列として取得する。 */
+async function readStreamTail(
+  stream: ReadableStream<Uint8Array> | null,
+  maxBytes: number = 4096,
+): Promise<string> {
+  if (!stream) return "";
+  const reader = stream.getReader();
+  let buf = new Uint8Array(0);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const merged = new Uint8Array(buf.length + value.length);
+      merged.set(buf);
+      merged.set(value, buf.length);
+      buf = merged.length > maxBytes ? merged.slice(merged.length - maxBytes) : merged;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return new TextDecoder().decode(buf);
+}
 
 export interface OpencodeServerInfo {
   baseUrl: string;
@@ -66,10 +91,14 @@ export class OpencodeServerStartError extends Error {
 const DEFAULT_USERNAME = "opencode";
 
 const defaultLogger: OpencodeServerLogger = {
-  info: (msg) => console.info(msg),
+  info: (msg) => {
+    void log("opencode_info", `msg=${JSON.stringify(msg)}`);
+  },
   error: (msg, err) => {
-    if (err) console.error(msg, err);
-    else console.error(msg);
+    void logError(
+      "opencode_error",
+      err ? `msg=${JSON.stringify(msg)} ${fmtErr(err)}` : `msg=${JSON.stringify(msg)}`,
+    );
   },
 };
 
@@ -169,6 +198,34 @@ export class OpencodeServerManager {
       );
     }
 
+    // opencode の権限ダイアログを抑止する。slaido は LLM がプロジェクト下の
+    // slides/index.html を Write/Edit するのを前提にしており、ユーザー個人の
+    // ローカル workspace なので blanket allow で安全。これをやらないと
+    // permission-request イベントで bridge.sendMessage が UI 応答待ちで stall する。
+    // 文字列 "allow" は全 tool に対する shorthand (opencode config schema の
+    // PermissionConfig: PermissionActionConfig | PermissionRuleObject)。
+    try {
+      writeFileSync(
+        joinPath(cwd, "opencode.json"),
+        JSON.stringify(
+          {
+            $schema: "https://opencode.ai/config.json",
+            // ユーザのグローバル設定からプラグインや壊れたエントリを継承しない
+            // (例: opencode-orchestrator のロード失敗ログを抑止)
+            plugin: [],
+            permission: "allow",
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (err) {
+      void logWarn(
+        "opencode_config_write_failed",
+        `cwd=${cwd} ${(err as Error).message}`,
+      );
+    }
+
     let port: number;
     try {
       port = await reservePort();
@@ -194,6 +251,10 @@ export class OpencodeServerManager {
         "serve",
         `--port=${port}`,
         "--hostname=127.0.0.1",
+        // ユーザグローバルの opencode 設定 (~/.config/opencode/opencode.json) で
+        // 指定された外部プラグインを読み込まない。slaido のセッションログを
+        // 関係ない plugin の load 失敗で汚さないためと、依存外を排する一貫性のため。
+        "--pure",
       ],
       cwd,
       env,
@@ -202,12 +263,29 @@ export class OpencodeServerManager {
     });
 
     this.subprocess = subprocess;
+    void log(
+      "opencode_subprocess_spawned",
+      `pid=${subprocess.pid} port=${port} cwd=${cwd}`,
+    );
 
-    subprocess.exited.then((code) => {
+    subprocess.exited.then(async (code) => {
+      // 想定外 exit 時は stderr の末尾を吸い上げて detail に含める。
+      // running / starting 中の exit のみ crash 扱いとし、停止フローでの exit は無視。
       if (this.status === "running" || this.status === "starting") {
         this.status = "crashed";
+        const tail = await readStreamTail(subprocess.stderr).catch(() => "");
+        const truncated = tail.slice(-1000);
+        void logError(
+          "opencode_subprocess_crashed",
+          `pid=${subprocess.pid} code=${code} stderrTail=${JSON.stringify(truncated)}`,
+        );
         this.logger.error(
           `[opencode] subprocess exited unexpectedly (code=${code})`
+        );
+      } else {
+        void log(
+          "opencode_subprocess_exited",
+          `pid=${subprocess.pid} code=${code} status=${this.status}`,
         );
       }
     });
@@ -215,16 +293,24 @@ export class OpencodeServerManager {
     try {
       await this.waitForHealth({ baseUrl, password });
     } catch (err) {
+      // 起動失敗時は stderr 末尾を含めて記録（外部コマンド失敗 policy）。
+      const tail = await readStreamTail(subprocess.stderr).catch(() => "");
+      void logError(
+        "opencode_startup_failed",
+        `pid=${subprocess.pid} ${fmtErr(err)} stderrTail=${JSON.stringify(tail.slice(-1000))}`,
+      );
       this.logger.error("[opencode] startup failed, killing subprocess", err);
       try {
         subprocess.kill("SIGKILL");
-      } catch {
-        // best-effort
+      } catch (killErr) {
+        // 既に exit 済み等で kill 失敗。ログだけ残して続行。
+        void log("opencode_startup_kill_failed", fmtErr(killErr));
       }
       try {
         await subprocess.exited;
-      } catch {
-        // ignore
+      } catch (exitErr) {
+        // exit 監視の失敗は致命的ではないが情報として残す。
+        void log("opencode_startup_exit_wait_failed", fmtErr(exitErr));
       }
       this.subprocess = null;
       this.status = "stopped";
@@ -264,6 +350,7 @@ export class OpencodeServerManager {
           headers: { Authorization: auth },
         });
         if (res.status === 200) {
+          // body の解放は best-effort。残してもメモリリークにはならず、ログ価値も低い。
           await res.body?.cancel().catch(() => {});
           return;
         }
@@ -284,7 +371,9 @@ export class OpencodeServerManager {
         headers: { Authorization: auth },
       });
       return res.status === 200;
-    } catch {
+    } catch (err) {
+      // health check のネットワーク失敗は false 扱いで OK。debug 観察用に warn を残す。
+      void logWarn("opencode_health_check_failed", fmtErr(err));
       return false;
     }
   }
@@ -309,8 +398,9 @@ export class OpencodeServerManager {
     this.status = "stopping";
     try {
       subprocess.kill("SIGTERM");
-    } catch {
-      // best-effort
+    } catch (err) {
+      // 既に exit 済み等で kill 失敗。ログだけ残して続行。
+      void log("opencode_stop_sigterm_failed", fmtErr(err));
     }
     const timeoutSentinel = Symbol("timeout");
     const result = await Promise.race<unknown>([
@@ -323,13 +413,14 @@ export class OpencodeServerManager {
       this.logger.info("[opencode] SIGTERM timed out, sending SIGKILL");
       try {
         subprocess.kill("SIGKILL");
-      } catch {
-        // best-effort
+      } catch (err) {
+        // 既に exit 済み等で kill 失敗。
+        void log("opencode_stop_sigkill_failed", fmtErr(err));
       }
       try {
         await subprocess.exited;
-      } catch {
-        // ignore
+      } catch (err) {
+        void log("opencode_stop_exit_wait_failed", fmtErr(err));
       }
     }
     this.subprocess = null;

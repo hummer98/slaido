@@ -13,12 +13,13 @@
  * before-quit / process.exit 経由で opencode サーバと ChatBridge を停止させる。
  */
 
-import Electrobun, { BrowserWindow } from "electrobun/bun";
+import Electrobun, { BrowserWindow, BrowserView } from "electrobun/bun";
+import { log, warn, error as logError, fmtErr } from "./logger";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { z } from "zod";
+import { decodeClientMessage, type ClientMessage } from "./host-message";
 import {
   getBundledTemplateRoot,
   getLastOpenedFile,
@@ -49,23 +50,19 @@ import {
   handleExportPdf,
   type ExportProgressMessage,
 } from "./export";
+import { join as pathJoin } from "node:path";
 
-const ClientMessageSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("ready") }),
-  z.object({ type: z.literal("chat"), content: z.string() }),
-  z.object({ type: z.literal("chat-cancel") }),
-  z.object({ type: z.literal("generate"), seedContent: z.string() }),
-  z.object({
-    type: z.literal("submit-api-key"),
-    key: z.string().min(20).startsWith("sk-or-"),
-  }),
-  z.object({ type: z.literal("open-signup-url") }),
-  z.object({ type: z.literal("reset-api-key") }),
-  z.object({ type: z.literal("export-pdf") }),
-  z.object({ type: z.literal("export-html-zip") }),
-]);
-
-type ClientMessage = z.infer<typeof ClientMessageSchema>;
+// E2E テスト時にネイティブ保存ダイアログをバイパスする。
+// SLAIDO_E2E_EXPORT_DIR が設定されていれば、ダイアログは表示せず
+// `${dir}/${defaultName}` を即座に返す showSaveDialog を注入する
+// (defaultName は orchestrator 側で拡張子付きに整形済)。
+function buildE2eShowSaveDialog():
+  | ((opts: { defaultName: string; filterExt: string }) => Promise<string | null>)
+  | undefined {
+  const dir = process.env["SLAIDO_E2E_EXPORT_DIR"];
+  if (!dir) return undefined;
+  return async (opts) => pathJoin(dir, opts.defaultName);
+}
 
 type ApiKeyErrorReason =
   | "unauthorized"
@@ -100,9 +97,18 @@ async function readLastOpened(): Promise<{ projectId: string } | null> {
   try {
     const raw = await readFile(path, "utf8");
     const parsed = LastOpenedSchema.safeParse(JSON.parse(raw));
-    if (!parsed.success) return null;
+    if (!parsed.success) {
+      void warn("last_opened_parse_failed", `path=${path}`);
+      return null;
+    }
     return { projectId: parsed.data.projectId };
-  } catch {
+  } catch (err) {
+    // 初回起動など last-opened.json が存在しない場合は ENOENT で握りつぶす。
+    // それ以外は warn でメタ情報を残す。
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      void warn("last_opened_read_failed", `path=${path} ${fmtErr(err)}`);
+    }
     return null;
   }
 }
@@ -126,8 +132,9 @@ async function bootstrapProject(store: ProjectStore): Promise<Project> {
         err instanceof ProjectStoreError &&
         (err.code === "PROJECT_NOT_FOUND" || err.code === "META_CORRUPTED")
       ) {
-        console.warn(
-          `[slAIdo] last-opened project ${lastJson.projectId} is unavailable (${err.code}); creating new project`,
+        void warn(
+          "last_opened_project_unavailable",
+          `projectId=${lastJson.projectId} code=${err.code}`,
         );
         project = null;
       } else {
@@ -150,27 +157,142 @@ function sendToWebView(win: BrowserWindow, msg: ServerMessage): void {
   );
 }
 
+/**
+ * 当該 slides/index.html を読み、`dist/*.css` / `dist/*.js` への相対参照を
+ * 同一フォルダから読んだ inline `<style>` / `<script>` に置換する。
+ *
+ * これは、Electrobun の親 webview (views://) から子 iframe (file://) を
+ * ロードしようとすると WebKit のクロスオリジン制約で空白になる問題への対処。
+ * 子 iframe を srcdoc で完結させれば cross-origin に依存しなくなる。
+ */
+async function loadInlinedSlidesHtml(slidesEntry: string): Promise<string> {
+  const html = await readFile(slidesEntry, "utf8");
+  const slidesDir = dirname(slidesEntry);
+  // <link rel="stylesheet" href="dist/foo.css"> → <style>...</style>
+  let out = await replaceAsync(
+    html,
+    /<link\s+[^>]*href=["']([^"']+\.css)["'][^>]*>/gi,
+    async (match, href) => {
+      try {
+        const css = await readFile(join(slidesDir, href), "utf8");
+        return `<style data-inlined-from="${href}">\n${css}\n</style>`;
+      } catch {
+        return match; // ファイルが無ければ元の link を残す
+      }
+    },
+  );
+  // <script src="dist/foo.js"></script> → <script>...</script>
+  out = await replaceAsync(
+    out,
+    /<script\s+[^>]*src=["']([^"']+\.js)["'][^>]*>\s*<\/script>/gi,
+    async (match, src) => {
+      try {
+        const js = await readFile(join(slidesDir, src), "utf8");
+        return `<script data-inlined-from="${src}">\n${js}\n</script>`;
+      } catch {
+        return match;
+      }
+    },
+  );
+  return out;
+}
+
+async function replaceAsync(
+  source: string,
+  re: RegExp,
+  replacer: (match: string, ...groups: string[]) => Promise<string>,
+): Promise<string> {
+  const matches = Array.from(source.matchAll(re));
+  if (matches.length === 0) return source;
+  const replacements = await Promise.all(
+    matches.map((m) => replacer(m[0], ...(m.slice(1) as string[]))),
+  );
+  let result = "";
+  let last = 0;
+  matches.forEach((m, i) => {
+    result += source.slice(last, m.index);
+    result += replacements[i];
+    last = (m.index ?? 0) + m[0].length;
+  });
+  result += source.slice(last);
+  return result;
+}
+
+function buildGeneratePrompt(slidesEntry: string, seedContent: string): string {
+  // LLM (opencode agent) が Write ツールで slidesEntry へ直接書き込む。
+  // チャットには簡潔な完了報告だけ返してもらい、HTML 本文は出さない
+  // (チャット欄を HTML 文字列で埋めないため)。
+  return [
+    "シードドキュメントから reveal.js スライドを生成してください。",
+    "",
+    `**Write ツールで以下の絶対パスにファイル全体を書き込んでください**: ${slidesEntry}`,
+    "",
+    "テンプレート (この形を厳守。head/script の dist/ 参照は維持):",
+    "```html",
+    "<!DOCTYPE html>",
+    '<html lang="ja">',
+    "<head>",
+    '  <meta charset="utf-8">',
+    '  <meta name="viewport" content="width=device-width, initial-scale=1">',
+    "  <title>...</title>",
+    '  <link rel="stylesheet" href="dist/reset.css">',
+    '  <link rel="stylesheet" href="dist/reveal.css">',
+    '  <link rel="stylesheet" href="dist/theme/black.css">',
+    "</head>",
+    "<body>",
+    '  <div class="reveal"><div class="slides">',
+    "    <section>...</section>  <!-- タイトル + 本編 + まとめで 5 枚以上 -->",
+    "  </div></div>",
+    '  <script src="dist/reveal.js"></script>',
+    "  <script>Reveal.initialize({hash:false});</script>",
+    "</body></html>",
+    "```",
+    "",
+    "**チャット欄での応答は完了報告のみ** (例: 「7 枚のスライドを生成しました」)。",
+    "**HTML 本文をチャットに貼り付けないでください**。Write ツールの結果だけで十分です。",
+    "",
+    "シード:",
+    seedContent,
+  ].join("\n");
+}
+
 async function generateSlides(
   win: BrowserWindow,
   bridge: ChatBridge | null,
   activeSession: { sessionId: string } | null,
+  project: Project | null,
   seedContent: string,
 ): Promise<void> {
   if (!bridge || !activeSession) {
+    void warn("generate_skipped_no_session", "reason=session_not_initialized");
     sendToWebView(win, { type: "error", message: "セッションが未初期化です" });
     return;
   }
+  if (!project) {
+    void warn("generate_skipped_no_project", "reason=project_not_initialized");
+    sendToWebView(win, { type: "error", message: "プロジェクトが未初期化です" });
+    return;
+  }
+  void log(
+    "generate_start",
+    `sessionId=${activeSession.sessionId} seedLen=${seedContent.length} slidesEntry=${project.slidesEntry}`,
+  );
   try {
     await bridge.sendMessage({
       sessionId: activeSession.sessionId,
       parts: [
         {
           type: "text",
-          text: `以下のシードドキュメントから reveal.js スライドを生成してください:\n\n${seedContent}`,
+          text: buildGeneratePrompt(project.slidesEntry, seedContent),
         },
       ],
     });
+    void log("generate_sent", `sessionId=${activeSession.sessionId}`);
   } catch (err) {
+    void logError(
+      "generate_failed",
+      `sessionId=${activeSession.sessionId} ${fmtErr(err)}`,
+    );
     sendToWebView(win, {
       type: "error",
       message: `生成失敗: ${(err as Error).message}`,
@@ -182,18 +304,35 @@ async function refineSlides(
   win: BrowserWindow,
   bridge: ChatBridge | null,
   activeSession: { sessionId: string } | null,
+  project: Project | null,
   userMessage: string,
 ): Promise<void> {
   if (!bridge || !activeSession) {
+    void warn("refine_skipped_no_session", "reason=session_not_initialized");
     sendToWebView(win, { type: "error", message: "セッションが未初期化です" });
     return;
   }
+  void log(
+    "refine_start",
+    `sessionId=${activeSession.sessionId} msgLen=${userMessage.length}`,
+  );
+  // 修正後の完全 HTML を ```html ... ``` で返してもらう。host 側がファイル書き込みする。
+  void project;
+  // Edit/Write ツールでファイルを直接修正してもらう。チャットには完了報告だけ。
+  const promptText = project
+    ? `${userMessage}\n\n対象ファイル: ${project.slidesEntry} を Edit/Write ツールで書き戻してください。チャット欄での応答は完了報告のみ。HTML 本文は貼らない。`
+    : userMessage;
   try {
     await bridge.sendMessage({
       sessionId: activeSession.sessionId,
-      parts: [{ type: "text", text: userMessage }],
+      parts: [{ type: "text", text: promptText }],
     });
+    void log("refine_sent", `sessionId=${activeSession.sessionId}`);
   } catch (err) {
+    void logError(
+      "refine_failed",
+      `sessionId=${activeSession.sessionId} ${fmtErr(err)}`,
+    );
     sendToWebView(win, {
       type: "error",
       message: `送信失敗: ${(err as Error).message}`,
@@ -213,8 +352,15 @@ async function setupPreviewSync(
       ? Number(debounceRaw)
       : undefined;
   const sync = new PreviewSync(debounceMs !== undefined ? { debounceMs } : {});
-  sync.onUpdate(({ url }) => {
-    sendToWebView(win, { type: "open-slides", url });
+  sync.onUpdate(async () => {
+    // file://直 URL は WebKit cross-origin で iframe が空白になるため、
+    // 内容を読んで dist/ アセットを inline した上で srcdoc で渡す。
+    try {
+      const html = await loadInlinedSlidesHtml(project.slidesEntry);
+      sendToWebView(win, { type: "slides", html });
+    } catch (err) {
+      void logError("slides_inline_failed", `${project.slidesEntry} ${fmtErr(err)}`);
+    }
   });
   await sync.start({
     projectId: project.meta.id,
@@ -242,25 +388,51 @@ function attachHandlers(
 ): void {
   win.on("host-message", (event: unknown) => {
     try {
-      if (typeof event !== "object" || event === null) return;
-      const data = (event as Record<string, unknown>).data;
-      const parsed = ClientMessageSchema.safeParse(data);
-      if (!parsed.success) return;
+      const decoded = decodeClientMessage(event);
+      if (!decoded.ok) {
+        if (decoded.kind === "non_object") {
+          void warn("host_message_invalid_event", "reason=non_object");
+        } else {
+          void warn(
+            "host_message_schema_invalid",
+            `dataType=${decoded.dataType} typeField=${JSON.stringify(decoded.typeField)} keys=${JSON.stringify(decoded.keys)} issues=${decoded.issuesJson}`,
+          );
+        }
+        return;
+      }
 
-      const msg: ClientMessage = parsed.data;
+      const msg: ClientMessage = decoded.msg;
+      void log("host_message_received", `type=${msg.type}`);
 
       if (msg.type === "ready") {
-        console.log("[slAIdo] クライアント接続");
+        void log("client_connected");
+        return;
+      }
+
+      if (msg.type === "client-warn") {
+        void warn(msg.event, msg.detail ?? "");
         return;
       }
 
       if (msg.type === "generate") {
-        void generateSlides(win, getActiveBridge(), getActiveSession(), msg.seedContent);
+        void generateSlides(
+          win,
+          getActiveBridge(),
+          getActiveSession(),
+          getActiveProject(),
+          msg.seedContent,
+        );
         return;
       }
 
       if (msg.type === "chat") {
-        void refineSlides(win, getActiveBridge(), getActiveSession(), msg.content);
+        void refineSlides(
+          win,
+          getActiveBridge(),
+          getActiveSession(),
+          getActiveProject(),
+          msg.content,
+        );
         return;
       }
 
@@ -268,22 +440,28 @@ function attachHandlers(
         const bridge = getActiveBridge();
         const session = getActiveSession();
         if (bridge && session) {
+          void log("chat_cancel_requested", `sessionId=${session.sessionId}`);
           void bridge.abort(session.sessionId);
+        } else {
+          void warn("chat_cancel_skipped", "reason=no_active_session");
         }
         return;
       }
 
       if (msg.type === "submit-api-key") {
+        void log("api_key_submit_requested", `key=${maskApiKey(msg.key)}`);
         void apiKeyHandlers.onSubmitApiKey(msg.key);
         return;
       }
 
       if (msg.type === "reset-api-key") {
+        void log("api_key_reset_requested");
         void apiKeyHandlers.onResetApiKey();
         return;
       }
 
       if (msg.type === "open-signup-url") {
+        void log("signup_url_open_requested");
         apiKeyHandlers.onOpenSignupUrl();
         return;
       }
@@ -299,13 +477,17 @@ function attachHandlers(
           });
           return;
         }
+        const e2eDialog = buildE2eShowSaveDialog();
         void handleExportPdf(
           {
             title: project.meta.title,
             slidesEntry: project.slidesEntry,
             templateRoot,
           },
-          { send: (m) => sendToWebView(win, m) },
+          {
+            send: (m) => sendToWebView(win, m),
+            ...(e2eDialog ? { showSaveDialog: e2eDialog } : {}),
+          },
         );
         return;
       }
@@ -321,18 +503,22 @@ function attachHandlers(
           });
           return;
         }
+        const e2eDialog = buildE2eShowSaveDialog();
         void handleExportHtmlZip(
           {
             title: project.meta.title,
             slidesDir: join(project.cwd, "slides"),
             templateRoot,
           },
-          { send: (m) => sendToWebView(win, m) },
+          {
+            send: (m) => sendToWebView(win, m),
+            ...(e2eDialog ? { showSaveDialog: e2eDialog } : {}),
+          },
         );
         return;
       }
     } catch (err) {
-      console.error("[slAIdo] host-message 処理失敗:", err);
+      void logError("host_message_handler_failed", fmtErr(err));
     }
   });
 }
@@ -342,8 +528,16 @@ async function determineProjectMode(project: Project): Promise<"seed" | "chat"> 
     const seedPath = join(project.cwd, "seed", "input.md");
     const content = await readFile(seedPath, "utf8");
     return content.trim() === "" ? "seed" : "chat";
-  } catch {
-    // seed/input.md が無いケースは seed mode (新規 / 旧プロジェクト)
+  } catch (err) {
+    // seed/input.md が無いケースは seed mode (新規 / 旧プロジェクト)。
+    // ENOENT 以外（権限エラー等）は warn でメタ情報を残す。
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      void warn(
+        "determine_project_mode_read_failed",
+        `projectId=${project.meta.id} ${fmtErr(err)}`,
+      );
+    }
     return "seed";
   }
 }
@@ -351,8 +545,7 @@ async function determineProjectMode(project: Project): Promise<"seed" | "chat"> 
 async function bootstrap(): Promise<void> {
   const projectsRoot = getProjectsRoot();
   const templateRoot = getBundledTemplateRoot();
-  console.log(`[slAIdo] projectsRoot=${projectsRoot}`);
-  console.log(`[slAIdo] templateRoot=${templateRoot}`);
+  void log("paths_resolved", `projectsRoot=${projectsRoot} templateRoot=${templateRoot}`);
 
   const store = new ProjectStore(projectsRoot, templateRoot);
   let activeProject: Project | null = null;
@@ -363,11 +556,36 @@ async function bootstrap(): Promise<void> {
   let projectModeSent = false;
   const keychain = new KeychainAdapter();
 
+  // E2E (bun-mot) 起動時のみ Electrobun の Bun→Browser RPC `maxRequestTime` を無制限にする。
+  // デフォルトは 1000ms (electrobun/api/shared/rpc.ts: DEFAULT_MAX_REQUEST_TIME) で、
+  // bun-mot の chunkTimeoutMs (5000ms) より短いため WaitFor が 1 秒で reject されてしまう。
+  const winRpc = process.env.BUN_MOT_PORT
+    ? BrowserView.defineRPC({
+        handlers: { requests: {}, messages: {} },
+        maxRequestTime: Infinity,
+      })
+    : undefined;
+
   const win = new BrowserWindow({
     title: "slAIdo",
     frame: { x: 0, y: 0, width: 1280, height: 800 },
     url: "views://mainview/index.html",
+    ...(winRpc ? { rpc: winRpc } : {}),
   });
+
+  // E2E ブリッジ (bun-mot): BUN_MOT_PORT が立っているときだけ bridge を立ち上げる。
+  // v0.1.1 で BunMotView シグネチャが Electrobun builtin RPC と一致したのでアダプタ不要。
+  if (process.env.BUN_MOT_PORT) {
+    const { setupBunMot } = await import("bun-mot/bridge");
+    const port = Number(process.env.BUN_MOT_PORT);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const bridge = setupBunMot(win.webview as any, { port });
+    // bun-mot launch() / E2E test runner が stdout 上のマーカー行を待つため、
+    // logger ではなく process.stdout.write で直接出す（プロセス間プロトコル）。
+    process.stdout.write(`fixture-bridge-ready port=${bridge.port}\n`);
+    void log("bunmot_bridge_started", `port=${bridge.port}`);
+    process.on("SIGTERM", () => bridge.stop());
+  }
 
   /**
    * R-1: open-slides を送る前に project-mode を一度だけ flush する.
@@ -380,15 +598,24 @@ async function bootstrap(): Promise<void> {
       const mode = await determineProjectMode(activeProject);
       sendToWebView(win, { type: "project-mode", mode });
     }
-    const url = pathToFileURL(activeProject.slidesEntry).href;
-    sendToWebView(win, { type: "open-slides", url });
+    await sendInlinedSlides(activeProject.slidesEntry);
+  }
+
+  async function sendInlinedSlides(slidesEntry: string): Promise<void> {
+    try {
+      const html = await loadInlinedSlidesHtml(slidesEntry);
+      sendToWebView(win, { type: "slides", html });
+    } catch (err) {
+      void logError("slides_inline_failed", `${slidesEntry} ${fmtErr(err)}`);
+    }
   }
 
   bootstrapProject(store)
     .then(async (project) => {
       activeProject = project;
-      console.log(
-        `[slAIdo] active project ${project.meta.id} title="${project.meta.title}" cwd=${project.cwd}`,
+      void log(
+        "active_project",
+        `id=${project.meta.id} title=${JSON.stringify(project.meta.title)} cwd=${project.cwd}`,
       );
       // 既に opencode が立ち上がっている場合、遅れてやってきた project を反映
       if (activeManager) {
@@ -396,7 +623,7 @@ async function bootstrap(): Promise<void> {
       }
     })
     .catch((err) => {
-      console.error("[slAIdo] bootstrap failed:", err);
+      void logError("bootstrap_failed", fmtErr(err));
     });
 
   /**
@@ -407,7 +634,7 @@ async function bootstrap(): Promise<void> {
       try {
         await activePreviewSync.stop();
       } catch (err) {
-        console.warn("[slAIdo] previous preview-sync stop failed:", err);
+        void warn("previous_preview_sync_stop_failed", fmtErr(err));
       }
       activePreviewSync = null;
     }
@@ -415,7 +642,7 @@ async function bootstrap(): Promise<void> {
       try {
         await activeBridge.dispose();
       } catch (err) {
-        console.warn("[slAIdo] previous chat-bridge dispose failed:", err);
+        void warn("previous_chat_bridge_dispose_failed", fmtErr(err));
       }
       activeBridge = null;
     }
@@ -424,7 +651,7 @@ async function bootstrap(): Promise<void> {
       try {
         await activeManager.stop();
       } catch (err) {
-        console.warn("[slAIdo] previous manager stop failed:", err);
+        void warn("previous_manager_stop_failed", fmtErr(err));
       }
       activeManager = null;
     }
@@ -446,7 +673,7 @@ async function bootstrap(): Promise<void> {
     try {
       await writeMinimalConfigForValidation(VALIDATION_CWD);
     } catch (err) {
-      console.error("[slAIdo] opencode.json の配置に失敗:", err);
+      void logError("opencode_json_write_failed", fmtErr(err));
       sendToWebView(win, {
         type: "api-key-error",
         reason: "startup",
@@ -464,7 +691,7 @@ async function bootstrap(): Promise<void> {
     try {
       info = await manager.start();
     } catch (err) {
-      console.error("[slAIdo] opencode start failed:", err);
+      void logError("opencode_start_failed", fmtErr(err));
       sendToWebView(win, {
         type: "api-key-error",
         reason: "startup",
@@ -477,15 +704,15 @@ async function bootstrap(): Promise<void> {
     if (runValidation) {
       try {
         await validateApiKey({ serverInfo: info });
-        console.log(`[slAIdo] api key validated (key=${maskApiKey(key)})`);
+        void log("api_key_validated", `key=${maskApiKey(key)}`);
       } catch (err) {
         const reason: ApiKeyErrorReason =
           err instanceof KeyValidationError ? err.reason : "unknown";
         const httpStatus =
           err instanceof KeyValidationError ? err.httpStatus : undefined;
-        console.error(
-          `[slAIdo] api key validation failed (key=${maskApiKey(key)}, httpStatus=${httpStatus ?? "n/a"}, reason=${reason}):`,
-          err,
+        void logError(
+          "api_key_validation_failed",
+          `key=${maskApiKey(key)} httpStatus=${httpStatus ?? "n/a"} reason=${reason} ${fmtErr(err)}`,
         );
         sendToWebView(win, {
           type: "api-key-error",
@@ -507,6 +734,12 @@ async function bootstrap(): Promise<void> {
     bridge.onEvent((ev) => {
       sendToWebView(win, { type: "chat-event", event: ev });
     });
+
+    // LLM 自身が opencode の Write/Edit ツールで slidesEntry を直接書き換える設計。
+    // ファイル変更は PreviewSync の chokidar が拾って iframe をリロードする。
+    // host 側でチャットテキストから HTML を抽出する経路は廃止 (チャット欄に HTML
+    // が出て煩雑だったため)。LLM が tool 呼び出しせず HTML を貼ってしまった場合は
+    // ファイルが更新されず警告だけ残す。
     try {
       await bridge.init({
         baseUrl: info.baseUrl,
@@ -514,7 +747,7 @@ async function bootstrap(): Promise<void> {
         username: info.username,
       });
     } catch (err) {
-      console.error("[slAIdo] chat-bridge 初期化失敗:", err);
+      void logError("chat_bridge_init_failed", fmtErr(err));
       sendToWebView(win, {
         type: "api-key-error",
         reason: "startup",
@@ -534,7 +767,7 @@ async function bootstrap(): Promise<void> {
       return false;
     }
     activeBridge = bridge;
-    console.log("[slAIdo] chat-bridge ready");
+    void log("chat_bridge_ready");
 
     // active project があればセッションを作成
     if (activeProject) {
@@ -542,9 +775,9 @@ async function bootstrap(): Promise<void> {
         activeSession = await bridge.createSession({
           title: activeProject.meta.title,
         });
-        console.log(`[slAIdo] active session ${activeSession.sessionId}`);
+        void log("active_session", `sessionId=${activeSession.sessionId}`);
       } catch (err) {
-        console.error("[slAIdo] createSession failed:", err);
+        void logError("create_session_failed", fmtErr(err));
         activeSession = null;
       }
     }
@@ -561,7 +794,7 @@ async function bootstrap(): Promise<void> {
           activeSession?.sessionId ?? null,
         );
       } catch (err) {
-        console.error("[slAIdo] PreviewSync start failed:", err);
+        void logError("preview_sync_start_failed", fmtErr(err));
         activePreviewSync = null;
       }
     }
@@ -569,8 +802,9 @@ async function bootstrap(): Promise<void> {
     if (runValidation) {
       sendToWebView(win, { type: "api-key-validated" });
     } else {
-      console.log(
-        `[slAIdo] opencode ready (key=${maskApiKey(key)}, validation skipped)`,
+      void log(
+        "opencode_ready",
+        `key=${maskApiKey(key)} validation=skipped`,
       );
     }
     return true;
@@ -621,7 +855,7 @@ async function bootstrap(): Promise<void> {
           await keychain.deleteApiKey();
         } catch (err) {
           if (!(err instanceof KeychainUnsupportedError)) {
-            console.warn("[slAIdo] keychain delete failed:", err);
+            void warn("keychain_delete_failed", fmtErr(err));
           }
         }
         sendToWebView(win, { type: "request-api-key" });
@@ -630,7 +864,7 @@ async function bootstrap(): Promise<void> {
         try {
           Electrobun.Utils.openExternal(SIGNUP_URL);
         } catch (err) {
-          console.error("[slAIdo] openExternal failed:", err);
+          void logError("open_external_failed", fmtErr(err));
         }
       },
     },
@@ -638,12 +872,12 @@ async function bootstrap(): Promise<void> {
   );
 
   win.webview.on("dom-ready", async () => {
-    console.log("[slAIdo] WebView 準備完了");
+    void log("webview_ready");
     let key: string | null = null;
     try {
       key = await keychain.getApiKey();
     } catch (err) {
-      console.error("[slAIdo] keychain getApiKey failed:", err);
+      void logError("keychain_get_api_key_failed", fmtErr(err));
       sendToWebView(win, {
         type: "api-key-error",
         reason: "keychain",

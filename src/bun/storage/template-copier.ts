@@ -45,6 +45,8 @@ async function exists(path: string): Promise<boolean> {
     await stat(path);
     return true;
   } catch {
+    // 存在判定の慣用句。ENOENT・権限エラー含めて全て「無い」扱い。
+    // 呼び出し側で次の操作（mkdir / throw 等）が判断するためログは残さない。
     return false;
   }
 }

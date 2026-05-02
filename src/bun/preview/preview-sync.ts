@@ -23,6 +23,7 @@ import { watch as chokidarWatch, type FSWatcher, type ChokidarOptions } from "ch
 
 import { extractToolPath } from "./extract-tool-path";
 import type { ChatEvent } from "../opencode/types";
+import { log, error as logError, fmtErr } from "../logger";
 
 // ---------------------------------------------------------------------------
 // 型定義
@@ -206,7 +207,7 @@ export class PreviewSync {
 
     this.watcher = watcher;
     watcher.on("error", (err) => {
-      console.error("[preview-sync] chokidar error:", err);
+      void logError("preview_sync_chokidar_error", fmtErr(err));
     });
     watcher.on("change", (path) => this.handleFsChange(String(path)));
 
@@ -230,8 +231,9 @@ export class PreviewSync {
 
     this.status = "running";
     if (!this.silent) {
-      console.log(
-        `[preview-sync] start projectId=${this.projectId} cwd=${this.cwd} slidesEntry=${this.slidesEntry}`,
+      void log(
+        "preview_sync_start",
+        `projectId=${this.projectId} cwd=${this.cwd} slidesEntry=${this.slidesEntry}`,
       );
     }
   }
@@ -255,7 +257,7 @@ export class PreviewSync {
       try {
         this.unsubscribeSse();
       } catch (err) {
-        console.error("[preview-sync] unsubscribe failed:", err);
+        void logError("preview_sync_unsubscribe_failed", fmtErr(err));
       }
       this.unsubscribeSse = null;
     }
@@ -264,14 +266,15 @@ export class PreviewSync {
       try {
         await this.watcher.close();
       } catch (err) {
-        console.error("[preview-sync] watcher close failed:", err);
+        void logError("preview_sync_watcher_close_failed", fmtErr(err));
       }
       this.watcher = null;
     }
 
     if (!this.silent) {
-      console.log(
-        `[preview-sync] stop counters=${JSON.stringify(this.counters)}`,
+      void log(
+        "preview_sync_stop",
+        `counters=${JSON.stringify(this.counters)}`,
       );
     }
 
@@ -289,7 +292,7 @@ export class PreviewSync {
       if (this.sseAvailable) {
         this.sseAvailable = false;
         if (!this.silent) {
-          console.log("[preview-sync] sse-closed; running on chokidar only");
+          void log("preview_sync_sse_closed", "fallback=chokidar_only");
         }
       }
       return;
@@ -395,8 +398,9 @@ export class PreviewSync {
     const valid = await this.isValidHtml(this.slidesEntry);
     if (!valid) {
       if (!this.silent) {
-        console.log(
-          `[preview-sync] reload skipped reason=invalid-html slidesEntry=${this.slidesEntry}`,
+        void log(
+          "preview_sync_reload_skipped",
+          `reason=invalid-html slidesEntry=${this.slidesEntry}`,
         );
       }
       return;
@@ -429,7 +433,7 @@ export class PreviewSync {
       try {
         h(info);
       } catch (err) {
-        console.error("[preview-sync] handler threw:", err);
+        void logError("preview_sync_handler_threw", fmtErr(err));
       }
     }
   }
@@ -446,7 +450,13 @@ export class PreviewSync {
         return false;
       }
       return true;
-    } catch {
+    } catch (err) {
+      // HTML 検証は best-effort。ファイル不在・読み取り失敗は invalid 扱いで OK。
+      // ただし権限エラー等の異常は debug に出す価値があるので warn を残す。
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code && code !== "ENOENT") {
+        void logError("preview_sync_html_check_failed", `file=${file} ${fmtErr(err)}`);
+      }
       return false;
     }
   }
@@ -473,7 +483,7 @@ export class PreviewSync {
       totalSinceFirstSignalMs: args.totalSinceFirstSignalMs,
       counters: { ...this.counters },
     };
-    console.log(`[preview-sync] reload ${JSON.stringify(payload)}`);
+    void log("preview_sync_reload", JSON.stringify(payload));
   }
 
   private async computeWatchPath(): Promise<string> {

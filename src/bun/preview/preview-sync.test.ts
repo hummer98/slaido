@@ -552,7 +552,7 @@ describe("PreviewSync structured logging", () => {
     await env.cleanup();
   });
 
-  test("[preview-sync] reload は JSON ペイロードに source / counters を含む", async () => {
+  test("preview_sync_reload は JSON ペイロードに source / counters を含む", async () => {
     sub.emit(
       makeToolStatus({
         tool: "edit",
@@ -561,9 +561,10 @@ describe("PreviewSync structured logging", () => {
       }),
     );
     await waitMs(80);
-    const reloadLog = logs.find((l) => l.startsWith("[preview-sync] reload {"));
+    const reloadLog = logs.find((l) => l.includes("preview_sync_reload "));
     expect(reloadLog).toBeDefined();
-    const json = JSON.parse(reloadLog!.replace(/^\[preview-sync\] reload /, ""));
+    const jsonText = reloadLog!.replace(/^.*preview_sync_reload /, "");
+    const json = JSON.parse(jsonText);
     expect(json.source).toBe("sse");
     expect(json.projectId).toBe("p1");
     expect(json.sessionId).toBe("s-test");
@@ -571,15 +572,15 @@ describe("PreviewSync structured logging", () => {
     expect(json.counters).toEqual({ sseOnly: 1, chokidarOnly: 0, both: 0 });
   });
 
-  test("[preview-sync] start ログを起動時に 1 行", () => {
-    const startLog = logs.find((l) => l.startsWith("[preview-sync] start"));
+  test("preview_sync_start ログを起動時に 1 行", () => {
+    const startLog = logs.find((l) => l.includes("preview_sync_start"));
     expect(startLog).toBeDefined();
     expect(startLog).toContain("projectId=p1");
   });
 
-  test("[preview-sync] stop counters=... を停止時に 1 行", async () => {
+  test("preview_sync_stop counters=... を停止時に 1 行", async () => {
     await sync.stop();
-    const stopLog = logs.find((l) => l.startsWith("[preview-sync] stop counters="));
+    const stopLog = logs.find((l) => l.includes("preview_sync_stop counters="));
     expect(stopLog).toBeDefined();
     expect(stopLog).toContain('"sseOnly":0');
   });
@@ -624,12 +625,12 @@ describe("PreviewSync sse-closed handling (Finding 2)", () => {
 
   test("error/sse-closed で 1 行ログ + 以後の SSE は無視される", async () => {
     sub.emit({ type: "error", reason: "sse-closed" });
-    expect(logs.some((l) => l.includes("[preview-sync] sse-closed"))).toBe(true);
+    expect(logs.some((l) => l.includes("preview_sync_sse_closed"))).toBe(true);
 
     // ログ重複しないこと
     sub.emit({ type: "error", reason: "sse-closed" });
     const occurrences = logs.filter((l) =>
-      l.includes("[preview-sync] sse-closed; running on chokidar only"),
+      l.includes("preview_sync_sse_closed"),
     ).length;
     expect(occurrences).toBe(1);
 

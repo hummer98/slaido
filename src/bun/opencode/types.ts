@@ -105,6 +105,19 @@ export type ChatEventRaw = {
   event: OpencodeRawEvent;
 };
 
+/**
+ * メッセージの role を伝える meta イベント。
+ * opencode は user メッセージ自身に対しても message.part.updated を emit するため、
+ * UI 側で text-chunk を assistant 扱いする前に role を判別する必要がある。
+ */
+export type ChatEventMessageMeta = {
+  type: "message-meta";
+  sessionId: string;
+  messageId: string;
+  role: "user" | "assistant";
+  raw: Extract<OpencodeRawEvent, { type: "message.updated" }>;
+};
+
 export type ChatEvent =
   | ChatEventTextChunk
   | ChatEventReasoningChunk
@@ -112,6 +125,7 @@ export type ChatEvent =
   | ChatEventPermissionRequest
   | ChatEventStepFinish
   | ChatEventError
+  | ChatEventMessageMeta
   | ChatEventRaw;
 
 /** `src/bun/index.ts` が UI へ転送する型. ServerMessage に追加する variant の元. */
@@ -193,6 +207,19 @@ export function normalizeEvent(event: OpencodeRawEvent): ChatEvent[] {
       default:
         return [{ type: "raw", event }];
     }
+  }
+
+  if (event.type === "message.updated") {
+    const info = event.properties.info;
+    return [
+      {
+        type: "message-meta",
+        sessionId: info.sessionID,
+        messageId: info.id,
+        role: info.role,
+        raw: event,
+      },
+    ];
   }
 
   if (event.type === "permission.updated") {

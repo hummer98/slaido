@@ -9,6 +9,7 @@ import {
   type ProjectId,
   type ProjectMeta,
 } from "./types";
+import { log, warn as logWarn, fmtErr } from "../logger";
 
 function buildInitialMeta(id: string, title: string, now: string): ProjectMeta {
   return {
@@ -60,7 +61,7 @@ export class ProjectStore {
         "utf8",
       );
 
-      console.log(`[slAIdo:store] created project ${meta.id} title="${meta.title}"`);
+      void log("project_created", `id=${meta.id} title=${JSON.stringify(meta.title)}`);
 
       return this.toProject(meta);
     } catch (err) {
@@ -111,7 +112,7 @@ export class ProjectStore {
       );
     }
 
-    console.log(`[slAIdo:store] loaded project ${result.data.id} title="${result.data.title}"`);
+    void log("project_loaded", `id=${result.data.id} title=${JSON.stringify(result.data.title)}`);
 
     return this.toProject(result.data);
   }
@@ -153,7 +154,7 @@ export class ProjectStore {
     const cwd = this.getCwd(projectId);
     try {
       await rm(cwd, { recursive: true, force: true });
-      console.log(`[slAIdo:store] deleted project ${projectId}`);
+      void log("project_deleted", `id=${projectId}`);
     } catch (err) {
       throw new ProjectStoreError(
         "DELETE_FAILED",
@@ -176,7 +177,7 @@ export class ProjectStore {
     try {
       await rm(target, { recursive: true, force: true });
     } catch (cleanupErr) {
-      console.warn(`[slAIdo:store] cleanup failed for ${target}:`, cleanupErr);
+      void logWarn("project_cleanup_failed", `target=${target} ${fmtErr(cleanupErr)}`);
     }
   }
 }

@@ -81,6 +81,13 @@ export interface ChatLogState {
    * true = seed mode、false = chat mode.
    */
   seedMode: boolean | null;
+  /**
+   * messageId → role のマップ。message-meta イベントで populate される。
+   * opencode は user メッセージにも text-chunk を emit するため、role が user の
+   * text-chunk は UI 描画から除外する必要がある (我々が seed-generate / user-send
+   * dispatch で既にプレースホルダを表示済のため二重表示を防ぐ)。
+   */
+  messageRoles: Record<string, "user" | "assistant">;
 }
 
 export type Action =
@@ -106,6 +113,7 @@ export function initialState(seedMode: boolean | null = null): ChatLogState {
     rawTrail: [],
     lastUserInput: null,
     seedMode,
+    messageRoles: {},
   };
 }
 
@@ -176,17 +184,38 @@ function handleChatEvent(state: ChatLogState, event: ChatEvent): ChatLogState {
   const trailed: ChatLogState = { ...state, rawTrail: [...state.rawTrail, event] };
   switch (event.type) {
     case "text-chunk":
+      // user メッセージの text-chunk は表示しない (seed-generate / user-send で既に
+      // プレースホルダを追加済。opencode が user 自身もエコー emit するための除外)
+      if (trailed.messageRoles[event.messageId] === "user") return trailed;
       return applyTextChunk(trailed, event);
     case "reasoning-chunk":
+      if (trailed.messageRoles[event.messageId] === "user") return trailed;
       return applyReasoningChunk(trailed, event);
     case "tool-status":
+      if (trailed.messageRoles[event.messageId] === "user") return trailed;
       return applyToolStatus(trailed, event);
     case "permission-request":
       return applyPermissionRequest(trailed, event);
     case "step-finish":
+      if (trailed.messageRoles[event.messageId] === "user") return trailed;
       return applyStepFinish(trailed, event);
     case "error":
       return applyError(trailed, event);
+    case "message-meta": {
+      const next = {
+        ...trailed,
+        messageRoles: { ...trailed.messageRoles, [event.messageId]: event.role },
+      };
+      // race 救済: meta 到着前に text-chunk が user メッセージを assistant として
+      // 追加していた場合は、ここで除去する。
+      if (event.role === "user") {
+        const filtered = next.messages.filter((m) => m.id !== event.messageId);
+        if (filtered.length !== next.messages.length) {
+          return { ...next, messages: filtered };
+        }
+      }
+      return next;
+    }
     case "raw":
       return trailed;
     default: {
