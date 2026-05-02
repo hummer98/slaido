@@ -20,6 +20,7 @@ import {
 import { exportHtmlZip as defaultExportHtmlZip } from "./html-zip";
 import { exportPdf as defaultExportPdf } from "./pdf";
 import { showSaveDialog as defaultShowSaveDialog } from "./save-dialog";
+import type { TranscriptLoggerLike } from "../opencode/transcript";
 
 export type ExportKind = "pdf" | "html-zip";
 
@@ -53,6 +54,16 @@ export interface ExportOrchestratorDeps {
   }) => Promise<string | null>;
   runPdf?: (args: RunPdfArgs) => Promise<void>;
   runHtmlZip?: (args: RunHtmlZipArgs) => Promise<void>;
+  /**
+   * opencode セッションログへ slaido メタデータを inject する logger.
+   * 未指定なら export start / done / error / canceled の transcript log は出さない.
+   */
+  transcript?: TranscriptLoggerLike;
+  /**
+   * transcript.log の extra に常に積みたいフィールド (主に projectId).
+   * 既存テストへの影響を抑えるため optional.
+   */
+  extra?: Record<string, unknown>;
 }
 
 export interface PdfRequest {
@@ -99,18 +110,38 @@ export async function handleExportPdf(
   const { send } = deps;
   const showDialog = deps.showSaveDialog ?? wrappedShowSaveDialog;
   const runPdf = deps.runPdf ?? defaultRunPdf;
+  const baseExtra: Record<string, unknown> = {
+    kind: "pdf",
+    projectTitle: req.title,
+    ...(deps.extra ?? {}),
+  };
+  const startedAt = Date.now();
 
   send({ type: "export-progress", kind: "pdf", phase: "start" });
+  deps.transcript?.log("slaido_export_pdf_start", {
+    ...baseExtra,
+    phase: "start",
+  });
 
   let outputPath: string | null;
   try {
     outputPath = await showDialog({ defaultName: `${req.title}.pdf`, filterExt: "pdf" });
   } catch (err) {
     send(toProgress("pdf", err));
+    deps.transcript?.error("slaido_export_pdf_failed", err, {
+      ...baseExtra,
+      phase: "error",
+      durationMs: Date.now() - startedAt,
+    });
     return;
   }
   if (outputPath === null) {
     send({ type: "export-progress", kind: "pdf", phase: "canceled", silent: true });
+    deps.transcript?.log("slaido_export_pdf_canceled", {
+      ...baseExtra,
+      phase: "canceled",
+      durationMs: Date.now() - startedAt,
+    });
     return;
   }
 
@@ -119,14 +150,29 @@ export async function handleExportPdf(
     userDataDir = await mkdtemp(join(tmpdir(), "slaido-pdf-userdata-"));
   } catch (err) {
     send(toProgress("pdf", err));
+    deps.transcript?.error("slaido_export_pdf_failed", err, {
+      ...baseExtra,
+      phase: "error",
+      durationMs: Date.now() - startedAt,
+    });
     return;
   }
 
   try {
     await runPdf({ slidesEntry: req.slidesEntry, outputPath, userDataDir });
     send({ type: "export-progress", kind: "pdf", phase: "done" });
+    deps.transcript?.log("slaido_export_pdf_end", {
+      ...baseExtra,
+      phase: "end",
+      durationMs: Date.now() - startedAt,
+    });
   } catch (err) {
     send(toProgress("pdf", err));
+    deps.transcript?.error("slaido_export_pdf_failed", err, {
+      ...baseExtra,
+      phase: "error",
+      durationMs: Date.now() - startedAt,
+    });
   } finally {
     await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -139,14 +185,29 @@ export async function handleExportHtmlZip(
   const { send } = deps;
   const showDialog = deps.showSaveDialog ?? wrappedShowSaveDialog;
   const runHtmlZip = deps.runHtmlZip ?? defaultRunHtmlZip;
+  const baseExtra: Record<string, unknown> = {
+    kind: "html-zip",
+    projectTitle: req.title,
+    ...(deps.extra ?? {}),
+  };
+  const startedAt = Date.now();
 
   send({ type: "export-progress", kind: "html-zip", phase: "start" });
+  deps.transcript?.log("slaido_export_html_zip_start", {
+    ...baseExtra,
+    phase: "start",
+  });
 
   let outputPath: string | null;
   try {
     outputPath = await showDialog({ defaultName: `${req.title}.zip`, filterExt: "zip" });
   } catch (err) {
     send(toProgress("html-zip", err));
+    deps.transcript?.error("slaido_export_html_zip_failed", err, {
+      ...baseExtra,
+      phase: "error",
+      durationMs: Date.now() - startedAt,
+    });
     return;
   }
   if (outputPath === null) {
@@ -155,6 +216,11 @@ export async function handleExportHtmlZip(
       kind: "html-zip",
       phase: "canceled",
       silent: true,
+    });
+    deps.transcript?.log("slaido_export_html_zip_canceled", {
+      ...baseExtra,
+      phase: "canceled",
+      durationMs: Date.now() - startedAt,
     });
     return;
   }
@@ -167,8 +233,18 @@ export async function handleExportHtmlZip(
       title: req.title,
     });
     send({ type: "export-progress", kind: "html-zip", phase: "done" });
+    deps.transcript?.log("slaido_export_html_zip_end", {
+      ...baseExtra,
+      phase: "end",
+      durationMs: Date.now() - startedAt,
+    });
   } catch (err) {
     send(toProgress("html-zip", err));
+    deps.transcript?.error("slaido_export_html_zip_failed", err, {
+      ...baseExtra,
+      phase: "error",
+      durationMs: Date.now() - startedAt,
+    });
   }
 }
 

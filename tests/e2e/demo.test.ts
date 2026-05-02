@@ -25,7 +25,14 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { spawn, type Subprocess } from "bun";
-import { existsSync, mkdtempSync, renameSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -379,6 +386,56 @@ test("DEMO.md 全工程: seed → generate → refine → export-zip → export-
   await mot.click("#export-pdf-btn");
   const pdfPath = join(EXPORT_DIR, "Untitled.pdf");
   await waitForFile(pdfPath, EXPORT_PDF_TIMEOUT_MS);
+
+  // ---- step 7: opencode セッションログへの slaido メタデータ inject 検証 ----
+  // T016. `~/.local/share/opencode/log/<latest>.log` に `service=slaido` 行が並び,
+  // 主要ライフサイクルイベントが extra フィールド付きで現れていることを確認する.
+  //
+  // 出力形式 (実機で 1 度叩いて確認済): flat key=value, extra は prefix 無し.
+  //   `INFO  2026-05-02T14:46:37 +2ms service=slaido slaidoVersion=0.1.0 projectId=p1 slaido_generate_start`
+  //
+  // 注: `slaido_started` は bootstrap 冒頭で transcript.log を撃つが, この時点では
+  // chat-bridge が未 init で client が null のため drop される (plan §2.4.2).
+  // よって opencode log には載らない. assertion からは外し, main.log の
+  // `transcript_log_failed reason=client_unavailable` warn 経由でだけ検知できる.
+  const opencodeLogDir = join(homedir(), ".local", "share", "opencode", "log");
+  const logFiles = readdirSync(opencodeLogDir)
+    .filter((f) => f.endsWith(".log"))
+    .map((f) => {
+      const p = join(opencodeLogDir, f);
+      return { path: p, mtimeMs: statSync(p).mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  expect(logFiles.length).toBeGreaterThan(0);
+  const latestLogPath = logFiles[0]!.path;
+  const latestLogContent = await readFile(latestLogPath, "utf8");
+  const slaidoLines = latestLogContent
+    .split("\n")
+    .filter((line) => line.includes("service=slaido"));
+  console.log("[e2e opencode-log]", latestLogPath, "slaido lines:", slaidoLines.length);
+
+  const requiredEvents = [
+    "slaido_opencode_ready",
+    "slaido_generate_start",
+    "slaido_generate_end",
+    "slaido_export_pdf_start",
+    "slaido_export_pdf_end",
+  ];
+  for (const ev of requiredEvents) {
+    const found = slaidoLines.some((line) => line.includes(ev));
+    if (!found) {
+      console.error(`[e2e missing event] ${ev} in ${latestLogPath}`);
+      console.error("--- slaido lines ---");
+      console.error(slaidoLines.join("\n"));
+    }
+    expect(found, `expected ${ev} in ${latestLogPath}`).toBe(true);
+  }
+
+  // baseExtra (slaidoVersion) と perEventExtra (projectId) が flat key=value で並ぶこと.
+  expect(slaidoLines.some((line) => /\bslaidoVersion=/.test(line))).toBe(true);
+  const projectIdLines = slaidoLines.filter((line) => /\bprojectId=/.test(line));
+  // 完了条件: 同一 projectId の行が 5 件以上 (1 セッション横断 grep が成り立つこと).
+  expect(projectIdLines.length).toBeGreaterThanOrEqual(5);
 
   await mot.pass("DEMO.md 全工程通過");
 }, TEST_TIMEOUT_MS);

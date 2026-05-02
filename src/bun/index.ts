@@ -44,6 +44,12 @@ import { ChatBridge } from "./opencode/chat-bridge";
 import type { ChatEvent } from "./opencode/types";
 import { OpencodeServerManager } from "./opencode/server-manager";
 import type { OpencodeServerInfo } from "./opencode/server-manager";
+import {
+  TranscriptLogger,
+  buildBaseExtra,
+  hashSeed,
+  type TranscriptLoggerLike,
+} from "./opencode/transcript";
 import { PreviewSync } from "./preview/preview-sync";
 import {
   handleExportHtmlZip,
@@ -261,6 +267,7 @@ async function generateSlides(
   bridge: ChatBridge | null,
   activeSession: { sessionId: string } | null,
   project: Project | null,
+  transcript: TranscriptLoggerLike,
   seedContent: string,
 ): Promise<void> {
   if (!bridge || !activeSession) {
@@ -277,6 +284,18 @@ async function generateSlides(
     "generate_start",
     `sessionId=${activeSession.sessionId} seedLen=${seedContent.length} slidesEntry=${project.slidesEntry}`,
   );
+  const startedAt = Date.now();
+  const baseTranscriptExtra = {
+    projectId: project.meta.id,
+    sessionId: activeSession.sessionId,
+    slidesEntry: project.slidesEntry,
+    seedLen: seedContent.length,
+    seedHash: hashSeed(seedContent),
+  };
+  transcript.log("slaido_generate_start", {
+    phase: "start",
+    ...baseTranscriptExtra,
+  });
   try {
     await bridge.sendMessage({
       sessionId: activeSession.sessionId,
@@ -288,11 +307,21 @@ async function generateSlides(
       ],
     });
     void log("generate_sent", `sessionId=${activeSession.sessionId}`);
+    transcript.log("slaido_generate_end", {
+      phase: "end",
+      durationMs: Date.now() - startedAt,
+      ...baseTranscriptExtra,
+    });
   } catch (err) {
     void logError(
       "generate_failed",
       `sessionId=${activeSession.sessionId} ${fmtErr(err)}`,
     );
+    transcript.error("slaido_generate_failed", err, {
+      phase: "error",
+      durationMs: Date.now() - startedAt,
+      ...baseTranscriptExtra,
+    });
     sendToWebView(win, {
       type: "error",
       message: `生成失敗: ${(err as Error).message}`,
@@ -305,6 +334,7 @@ async function refineSlides(
   bridge: ChatBridge | null,
   activeSession: { sessionId: string } | null,
   project: Project | null,
+  transcript: TranscriptLoggerLike,
   userMessage: string,
 ): Promise<void> {
   if (!bridge || !activeSession) {
@@ -316,8 +346,20 @@ async function refineSlides(
     "refine_start",
     `sessionId=${activeSession.sessionId} msgLen=${userMessage.length}`,
   );
-  // 修正後の完全 HTML を ```html ... ``` で返してもらう。host 側がファイル書き込みする。
-  void project;
+  const startedAt = Date.now();
+  const baseTranscriptExtra: Record<string, unknown> = {
+    sessionId: activeSession.sessionId,
+    msgLen: userMessage.length,
+    msgHash: hashSeed(userMessage),
+  };
+  if (project) {
+    baseTranscriptExtra.projectId = project.meta.id;
+    baseTranscriptExtra.slidesEntry = project.slidesEntry;
+  }
+  transcript.log("slaido_refine_start", {
+    phase: "start",
+    ...baseTranscriptExtra,
+  });
   // Edit/Write ツールでファイルを直接修正してもらう。チャットには完了報告だけ。
   const promptText = project
     ? `${userMessage}\n\n対象ファイル: ${project.slidesEntry} を Edit/Write ツールで書き戻してください。チャット欄での応答は完了報告のみ。HTML 本文は貼らない。`
@@ -328,11 +370,21 @@ async function refineSlides(
       parts: [{ type: "text", text: promptText }],
     });
     void log("refine_sent", `sessionId=${activeSession.sessionId}`);
+    transcript.log("slaido_refine_end", {
+      phase: "end",
+      durationMs: Date.now() - startedAt,
+      ...baseTranscriptExtra,
+    });
   } catch (err) {
     void logError(
       "refine_failed",
       `sessionId=${activeSession.sessionId} ${fmtErr(err)}`,
     );
+    transcript.error("slaido_refine_failed", err, {
+      phase: "error",
+      durationMs: Date.now() - startedAt,
+      ...baseTranscriptExtra,
+    });
     sendToWebView(win, {
       type: "error",
       message: `送信失敗: ${(err as Error).message}`,
@@ -383,6 +435,7 @@ function attachHandlers(
   getActiveProject: () => Project | null,
   getActiveBridge: () => ChatBridge | null,
   getActiveSession: () => { sessionId: string } | null,
+  transcript: TranscriptLoggerLike,
   apiKeyHandlers: ApiKeyHandlers,
   templateRoot: string,
 ): void {
@@ -420,6 +473,7 @@ function attachHandlers(
           getActiveBridge(),
           getActiveSession(),
           getActiveProject(),
+          transcript,
           msg.seedContent,
         );
         return;
@@ -431,6 +485,7 @@ function attachHandlers(
           getActiveBridge(),
           getActiveSession(),
           getActiveProject(),
+          transcript,
           msg.content,
         );
         return;
@@ -486,6 +541,8 @@ function attachHandlers(
           },
           {
             send: (m) => sendToWebView(win, m),
+            transcript,
+            extra: { projectId: project.meta.id },
             ...(e2eDialog ? { showSaveDialog: e2eDialog } : {}),
           },
         );
@@ -512,6 +569,8 @@ function attachHandlers(
           },
           {
             send: (m) => sendToWebView(win, m),
+            transcript,
+            extra: { projectId: project.meta.id },
             ...(e2eDialog ? { showSaveDialog: e2eDialog } : {}),
           },
         );
@@ -519,6 +578,7 @@ function attachHandlers(
       }
     } catch (err) {
       void logError("host_message_handler_failed", fmtErr(err));
+      transcript.error("slaido_host_message_failed", err);
     }
   });
 }
@@ -555,6 +615,15 @@ async function bootstrap(): Promise<void> {
   let activePreviewSync: PreviewSync | null = null;
   let projectModeSent = false;
   const keychain = new KeychainAdapter();
+
+  // TranscriptLogger は bootstrap 冒頭で 1 度だけ構築する。
+  // chat-bridge がまだ無い時点 (= 起動直後) でも `slaido_started` を撃ちたいので,
+  // client は遅延参照 (`getClient` callback) にして null 期間は no-op + 1 度だけ warn.
+  const transcript: TranscriptLoggerLike = new TranscriptLogger({
+    getClient: () => activeBridge?.getClient() ?? null,
+    baseExtra: buildBaseExtra(),
+  });
+  transcript.log("slaido_started", { phase: "start" });
 
   // E2E (bun-mot) 起動時のみ Electrobun の Bun→Browser RPC `maxRequestTime` を無制限にする。
   // デフォルトは 1000ms (electrobun/api/shared/rpc.ts: DEFAULT_MAX_REQUEST_TIME) で、
@@ -692,6 +761,7 @@ async function bootstrap(): Promise<void> {
       info = await manager.start();
     } catch (err) {
       void logError("opencode_start_failed", fmtErr(err));
+      transcript.error("slaido_opencode_failed", err, { phase: "error" });
       sendToWebView(win, {
         type: "api-key-error",
         reason: "startup",
@@ -748,6 +818,7 @@ async function bootstrap(): Promise<void> {
       });
     } catch (err) {
       void logError("chat_bridge_init_failed", fmtErr(err));
+      transcript.error("slaido_opencode_failed", err, { phase: "error" });
       sendToWebView(win, {
         type: "api-key-error",
         reason: "startup",
@@ -782,6 +853,14 @@ async function bootstrap(): Promise<void> {
       }
     }
 
+    // chat-bridge が立ち上がり client が遅延参照可能になったので, opencode log への
+    // inject 経路が開通したことを記録する (slaido_started の warn とは別経路).
+    transcript.log("slaido_opencode_ready", {
+      phase: "ready",
+      ...(activeSession ? { sessionId: activeSession.sessionId } : {}),
+      ...(activeProject ? { projectId: activeProject.meta.id } : {}),
+    });
+
     // T012 PreviewSync: SSE tool-status + chokidar の二経路で iframe 再ロードを駆動.
     // 初期 reload は dom-ready ハンドラ / startManagerWithKey 成功後の open-slides に任せる
     // ため PreviewSync は変化時のみ専任 (plan §4.3).
@@ -815,6 +894,7 @@ async function bootstrap(): Promise<void> {
     () => activeProject,
     () => activeBridge,
     () => activeSession,
+    transcript,
     {
       onSubmitApiKey: async (key) => {
         try {
