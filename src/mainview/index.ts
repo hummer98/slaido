@@ -67,6 +67,9 @@ declare global {
   }
 }
 
+const chatPane = document.getElementById("chat-pane") as HTMLDivElement;
+const chatTabs = document.getElementById("chat-tabs") as HTMLDivElement;
+const seedDisplay = document.getElementById("seed-display") as HTMLDivElement;
 const chatMessages = document.getElementById("chat-messages") as HTMLDivElement;
 const seedInput = document.getElementById("seed-input") as HTMLTextAreaElement;
 const generateBtn = document.getElementById("generate-btn") as HTMLButtonElement;
@@ -128,11 +131,46 @@ function scheduleRender(): void {
 function render(): void {
   applySeedModeClass();
   renderMessages();
+  renderSeedDisplay();
   renderInputArea();
   if (isDevMode()) {
     renderDevRawTrail();
   }
 }
+
+function renderSeedDisplay(): void {
+  const seed = state.seedDocument;
+  if (seed === null || seed === "") {
+    seedDisplay.classList.add("empty");
+    seedDisplay.textContent = "シードはまだ入力されていません";
+    return;
+  }
+  seedDisplay.classList.remove("empty");
+  seedDisplay.textContent = seed;
+}
+
+type TabName = "chat" | "seed";
+
+function setActiveTab(tab: TabName): void {
+  chatPane.dataset["activeTab"] = tab;
+  chatTabs.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset["tab"] === tab);
+  });
+  if (tab === "chat") {
+    // 表示復帰時はスクロール末尾へ (display:none 中は scrollHeight が確定しないため
+    // レイアウト確定後に rAF で実行)
+    requestAnimationFrame(() => {
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    });
+  }
+}
+
+chatTabs.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const tab = btn.dataset["tab"];
+    if (tab === "chat" || tab === "seed") setActiveTab(tab);
+  });
+});
 
 function applySeedModeClass(): void {
   const mode =

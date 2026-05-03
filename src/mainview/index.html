@@ -285,6 +285,70 @@
       display: none;
     }
 
+    /* タブ: チャット / シード切替。チャットモード時のみ表示 */
+    #chat-tabs {
+      display: flex;
+      border-bottom: 1px solid #2d2d4e;
+      flex-shrink: 0;
+    }
+
+    body[data-seed-mode="seed"] #chat-tabs,
+    body[data-seed-mode="loading"] #chat-tabs {
+      display: none;
+    }
+
+    .tab-btn {
+      flex: 1;
+      background: transparent;
+      color: #888;
+      border: none;
+      border-bottom: 2px solid transparent;
+      padding: 10px 16px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+
+    .tab-btn:hover {
+      color: #a0c4ff;
+    }
+
+    .tab-btn.active {
+      color: #a0c4ff;
+      border-bottom-color: #a0c4ff;
+    }
+
+    /* タブで chat-messages / seed-display を排他切替 */
+    #chat-pane[data-active-tab="seed"] #chat-messages,
+    #chat-pane[data-active-tab="seed"] #dev-raw-trail {
+      display: none;
+    }
+
+    #chat-pane:not([data-active-tab="seed"]) #seed-display {
+      display: none;
+    }
+
+    #seed-display {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #c0c8d4;
+      background: #0d0d1a;
+    }
+
+    #seed-display.empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #555;
+      font-style: italic;
+    }
+
     /* dev トグル */
     #dev-raw-trail {
       border-top: 1px dashed #2d2d4e;
@@ -674,12 +738,17 @@
       .permission-prompt { background: #fff7e0; color: #5a3d0e; border-color: #d99e2b; }
       .permission-prompt button { color: #5a3d0e; border-color: #d99e2b; }
       .permission-prompt button[data-action="allow"] { background: #ffd166; color: #1a1a2e; }
+      #chat-tabs { border-bottom-color: #ddd; }
+      .tab-btn { color: #888; }
+      .tab-btn:hover, .tab-btn.active { color: #4a90d9; }
+      .tab-btn.active { border-bottom-color: #4a90d9; }
+      #seed-display { background: #f9fafb; color: #1a1a2e; }
     }
   </style>
 </head>
 <body>
   <div id="app">
-    <div id="chat-pane">
+    <div id="chat-pane" data-active-tab="chat">
       <div id="chat-header">
         <span id="chat-header-title">sl<span style="color:#ff6b6b">AI</span>do</span>
         <span id="dev-indicator">DEV</span>
@@ -688,7 +757,14 @@
         </button>
       </div>
 
+      <div id="chat-tabs">
+        <button class="tab-btn active" data-tab="chat" type="button">チャット</button>
+        <button class="tab-btn" data-tab="seed" type="button">シード</button>
+      </div>
+
       <div id="chat-messages"></div>
+
+      <div id="seed-display"></div>
 
       <div id="dev-raw-trail">
         <div id="dev-raw-trail-title">RAW EVENTS</div>

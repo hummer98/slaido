@@ -88,6 +88,11 @@ export interface ChatLogState {
    * dispatch で既にプレースホルダを表示済のため二重表示を防ぐ)。
    */
   messageRoles: Record<string, "user" | "assistant">;
+  /**
+   * 最初に投入された seed 本文。シードタブで参照表示するために保持する。
+   * lastUserInput は user-send で上書きされるため別フィールドで保持する必要がある。
+   */
+  seedDocument: string | null;
 }
 
 export type Action =
@@ -114,6 +119,7 @@ export function initialState(seedMode: boolean | null = null): ChatLogState {
     lastUserInput: null,
     seedMode,
     messageRoles: {},
+    seedDocument: null,
   };
 }
 
@@ -123,7 +129,12 @@ export function reduce(state: ChatLogState, action: Action): ChatLogState {
       return appendUserMessage(state, action.text);
     case "seed-generate": {
       const next = appendUserMessage(state, SEED_GENERATE_USER_TEXT);
-      return { ...next, seedMode: false, lastUserInput: action.seed };
+      return {
+        ...next,
+        seedMode: false,
+        lastUserInput: action.seed,
+        seedDocument: action.seed,
+      };
     }
     case "exit-seed-mode":
       return { ...state, seedMode: false };
