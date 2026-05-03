@@ -14,6 +14,7 @@ dist/
 /bin/
 /.cache/
 /artifacts/
+.worktrees/
 
 # fastlane 生成物
 fastlane/report.xml
