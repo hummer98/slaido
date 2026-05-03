@@ -56,6 +56,8 @@ brew update && brew upgrade --cask slaido
 
 Grab `slAIdo-v0.1.0-macos-arm64.zip` from the [v0.1.0 release](https://github.com/hummer98/slaido/releases/tag/v0.1.0), unzip it, and move `slAIdo.app` into `/Applications`.
 
+Releases are built and published automatically by GitHub Actions on tag push (`v*.*.*`). The Homebrew Cask at `hummer98/slaido` is updated by a follow-up workflow as soon as the release is live, so `brew upgrade --cask slaido` reflects new versions without manual steps. See [`docs/release-automation.md`](./docs/release-automation.md) for the full pipeline.
+
 ## Usage
 
 1. Launch **slAIdo** from `/Applications` (or Spotlight).
@@ -83,7 +85,7 @@ bun test                 # unit tests (bun:test)
 bun test:e2e             # Electrobun integration tests
 ```
 
-Signing and notarization for release builds is handled by Electrobun + fastlane — see [`docs/signing-setup.md`](./docs/signing-setup.md). The release flow itself is documented in [`CHANGELOG.md`](./CHANGELOG.md).
+Signing and notarization for release builds is handled by Electrobun + fastlane — see [`docs/signing-setup.md`](./docs/signing-setup.md). The release pipeline (CI build + Cask update) is documented in [`docs/release-automation.md`](./docs/release-automation.md); per-version notes live in [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## Privacy
 

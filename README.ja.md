@@ -56,6 +56,8 @@ brew update && brew upgrade --cask slaido
 
 [v0.1.0 リリースページ](https://github.com/hummer98/slaido/releases/tag/v0.1.0) から `slAIdo-v0.1.0-macos-arm64.zip` をダウンロードし、解凍して `slAIdo.app` を `/Applications` に配置してください。
 
+リリースビルドは tag push (`v*.*.*`) を契機に GitHub Actions が自動でビルド・署名・公証・publish します。Homebrew Cask (`hummer98/slaido`) も後続の workflow で自動更新されるため、新バージョン公開後すぐに `brew upgrade --cask slaido` で取得できます。CI パイプラインの全体像は [`docs/release-automation.md`](./docs/release-automation.md) を参照してください。
+
 ## 使い方
 
 1. `/Applications` または Spotlight から **slAIdo** を起動します。
@@ -83,7 +85,7 @@ bun test                 # ユニットテスト (bun:test)
 bun test:e2e             # Electrobun 統合テスト
 ```
 
-リリースビルドの署名・公証は Electrobun + fastlane で完結します。詳細は [`docs/signing-setup.md`](./docs/signing-setup.md)。リリースフロー自体は [`CHANGELOG.md`](./CHANGELOG.md) を参照してください。
+リリースビルドの署名・公証は Electrobun + fastlane で完結します。詳細は [`docs/signing-setup.md`](./docs/signing-setup.md)。リリースパイプライン全体（CI ビルド + Cask 更新）は [`docs/release-automation.md`](./docs/release-automation.md)、バージョンごとの履歴は [`CHANGELOG.md`](./CHANGELOG.md) を参照してください。
 
 ## プライバシー
 

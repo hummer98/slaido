@@ -1,0 +1,150 @@
+name: Update Homebrew Cask on Release
+
+# build-release.yml (Build and Release) の完了を
+# workflow_run トリガーで検知して起動し、hummer98/homebrew-slaido の
+# Casks/slaido.rb を自動更新する。Casks/slaido.rb の現物は slaido 本体には
+# 存在せず、workflow 実行時に actions/checkout で tap リポジトリを
+# clone してから sed で書き換える。詳細は docs/release-automation.md を参照。
+#
+# トリガー方式の経緯: 旧方式 (release: published) は build-release.yml の
+# release 作成と asset upload の間にレースが発生し、update-tap が先に走って
+# zip asset を見つけられず失敗する事故が起きた (mado T040 で実証)。
+# workflow_run であれば build-release の完了を確実に待ってから発火する。
+#
+# 認証: PAT ではなく GitHub App (hummer98-tap-updater) を使用する。
+# APP_ID / APP_PRIVATE_KEY を secrets に登録し、
+# actions/create-github-app-token でインストールトークンを取得して checkout する。
+
+on:
+  workflow_run:
+    workflows: ["Build and Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.0)'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-homebrew-cask
+  cancel-in-progress: false
+
+jobs:
+  update-cask:
+    # workflow_dispatch は常に許可（手動再実行・過去 tag の補正用）。
+    # workflow_run は build-release.yml が push tag で起動して成功した場合のみ許可:
+    #   - conclusion == 'success': 失敗・キャンセル・skipped を除外
+    #   - event == 'push': workflow_dispatch 由来の dry-run (release を作らない) を除外
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: macos-latest
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          # workflow_run.head_branch は tag push のとき tag 名 (例: "v0.3.0") が入る。
+          # tag push 以外 (push to branch) では branch 名が入るが、
+          # build-release.yml は `on: push: tags: ['v*.*.*']` でしか push 起動しないので、
+          # if: ガードで event == 'push' を通った時点で tag 名と確定できる。
+          WORKFLOW_RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${WORKFLOW_RUN_TAG:-$INPUT_TAG}"
+          if [ -z "$TAG" ]; then
+            echo "::error::No tag resolved (workflow_run.head_branch / inputs.tag both empty)"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch zip asset URL
+        id: asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          URL=$(gh release view "$TAG" \
+            --repo "$REPO" \
+            --json assets \
+            --jq '.assets[] | select(.name|endswith("-macos-arm64.zip")) | .url')
+          if [ -z "$URL" ]; then
+            echo "::error::No macos-arm64.zip asset found for $TAG"
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Download & hash
+        id: hash
+        env:
+          ASSET_URL: ${{ steps.asset.outputs.url }}
+        run: |
+          curl -fL --retry 3 --retry-delay 5 -o slaido.zip "$ASSET_URL"
+          if [ ! -s slaido.zip ]; then
+            echo "::error::Downloaded slaido.zip is empty"
+            exit 1
+          fi
+          SHA=$(shasum -a 256 slaido.zip | awk '{print $1}')
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: homebrew-slaido
+          owner: hummer98
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: hummer98/homebrew-slaido
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+
+      - name: Update Casks/slaido.rb
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          # version 行と sha256 行を置換。url 行は `v#{version}` 補間のため置換不要。
+          sed -i '' -E "s/^(  version )\"[^\"]+\"/\1\"$VERSION\"/" Casks/slaido.rb
+          sed -i '' -E "s/^(  sha256 )\"[0-9a-f]{64}\"/\1\"$SHA256\"/" Casks/slaido.rb
+
+      - name: Verify changes
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          git diff Casks/slaido.rb
+          grep -q "version \"$VERSION\"" Casks/slaido.rb \
+            || { echo "::error::version update failed"; exit 1; }
+          grep -q "sha256 \"$SHA256\"" Casks/slaido.rb \
+            || { echo "::error::sha256 update failed"; exit 1; }
+          # url 行が v#{version} 補間形式であることを確認（リテラル version 文字列は不要）
+          grep -q 'v#{version}' Casks/slaido.rb \
+            || { echo "::error::url does not use v#{version} interpolation in Casks/slaido.rb"; exit 1; }
+
+      - name: Commit & push
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add Casks/slaido.rb
+          if git diff --cached --quiet; then
+            echo "No changes (already up-to-date)"
+            exit 0
+          fi
+          git commit -m "chore: bump slaido to v$VERSION"
+          git push
