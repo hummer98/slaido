@@ -139,4 +139,115 @@ describe("decodeClientMessage", () => {
       throw new Error("expected schema_invalid");
     }
   });
+
+  // T019 — interview / rubric / preset 経路 (plan §3.3)
+
+  test("list-presets: payload なしで parse", () => {
+    const r = decodeClientMessage(envelope({ type: "list-presets" }));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.msg.type).toBe("list-presets");
+  });
+
+  test("use-preset: presetId 必須 (空文字は reject)", () => {
+    const ok = decodeClientMessage(envelope({ type: "use-preset", presetId: "abc" }));
+    expect(ok.ok).toBe(true);
+    const ng = decodeClientMessage(envelope({ type: "use-preset", presetId: "" }));
+    expect(ng.ok).toBe(false);
+  });
+
+  test("interview-start: seedContent を含めて parse", () => {
+    const r = decodeClientMessage(
+      envelope({ type: "interview-start", seedContent: "# title" }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok && r.msg.type === "interview-start") {
+      expect(r.msg.seedContent).toBe("# title");
+    } else {
+      throw new Error("expected interview-start");
+    }
+  });
+
+  test("interview-skip: seedContent を含めて parse (空 rubric で生成へ)", () => {
+    const r = decodeClientMessage(
+      envelope({ type: "interview-skip", seedContent: "x" }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok && r.msg.type === "interview-skip") {
+      expect(r.msg.seedContent).toBe("x");
+    } else {
+      throw new Error("expected interview-skip");
+    }
+  });
+
+  test("interview-answer: turnIndex (>=0) と answer", () => {
+    const ok = decodeClientMessage(
+      envelope({ type: "interview-answer", turnIndex: 0, answer: "a" }),
+    );
+    expect(ok.ok).toBe(true);
+    const negative = decodeClientMessage(
+      envelope({ type: "interview-answer", turnIndex: -1, answer: "a" }),
+    );
+    expect(negative.ok).toBe(false);
+  });
+
+  test("interview-cancel: payload なしで parse", () => {
+    const r = decodeClientMessage(envelope({ type: "interview-cancel" }));
+    expect(r.ok).toBe(true);
+  });
+
+  test("rubric-confirm: 完全な rubric / alsoSavePreset / presetName を parse", () => {
+    const rubric = {
+      schemaVersion: 1,
+      axes: {
+        audience: "x",
+        duration_min: 10,
+        purpose: "教育",
+        success_criteria: null,
+        tone: null,
+        anti_patterns: [],
+      },
+      raw_interview_log: [],
+      createdAt: "2026-05-04T00:00:00.000Z",
+      updatedAt: "2026-05-04T00:00:00.000Z",
+    };
+    const r = decodeClientMessage(
+      envelope({
+        type: "rubric-confirm",
+        rubric,
+        seedContent: "シード本文",
+        alsoSavePreset: true,
+        presetName: "社内 LT",
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok && r.msg.type === "rubric-confirm") {
+      expect(r.msg.alsoSavePreset).toBe(true);
+      expect(r.msg.presetName).toBe("社内 LT");
+      expect(r.msg.rubric.axes.purpose).toBe("教育");
+      expect(r.msg.seedContent).toBe("シード本文");
+    } else {
+      throw new Error("expected rubric-confirm");
+    }
+  });
+
+  test("rubric-confirm: rubric の schema 違反は reject", () => {
+    const broken = {
+      schemaVersion: 2, // 1 以外
+      axes: {
+        audience: null,
+        duration_min: null,
+        purpose: null,
+        success_criteria: null,
+        tone: null,
+        anti_patterns: [],
+      },
+      raw_interview_log: [],
+      createdAt: "x",
+      updatedAt: "x",
+    };
+    const r = decodeClientMessage(
+      envelope({ type: "rubric-confirm", rubric: broken, seedContent: "x", alsoSavePreset: false }),
+    );
+    expect(r.ok).toBe(false);
+  });
 });

@@ -24,10 +24,16 @@ import {
   getBundledTemplateRoot,
   getLastOpenedFile,
   getProjectsRoot,
+  getRubricPresetsRoot,
 } from "./storage/app-paths";
 import { ProjectStore } from "./storage/project-store";
 import { ProjectStoreError } from "./storage/types";
 import type { Project } from "./storage/types";
+import { RubricStore } from "./storage/rubric-store";
+import { PresetStore } from "./storage/preset-store";
+import type { DeckRubric, RubricPreset } from "./storage/rubric-types";
+import { buildGeneratePrompt } from "./generate-prompt";
+import { InterviewOrchestrator } from "./interview/orchestrator";
 
 import {
   KeychainAdapter,
@@ -88,6 +94,17 @@ type ServerMessage =
   | { type: "request-api-key" }
   | { type: "api-key-validated" }
   | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string }
+  | { type: "presets-list"; presets: RubricPreset[] }
+  | {
+      type: "interview-question";
+      turnIndex: number;
+      question: string;
+      askedCount: number;
+      maxQuestions: number;
+    }
+  | { type: "interview-done"; rubric: DeckRubric }
+  | { type: "interview-error"; message: string }
+  | { type: "preset-saved"; preset: RubricPreset }
   | ExportProgressMessage;
 
 const VALIDATION_CWD = join(tmpdir(), "slaido-opencode");
@@ -224,44 +241,6 @@ async function replaceAsync(
   return result;
 }
 
-function buildGeneratePrompt(slidesEntry: string, seedContent: string): string {
-  // LLM (opencode agent) が Write ツールで slidesEntry へ直接書き込む。
-  // チャットには簡潔な完了報告だけ返してもらい、HTML 本文は出さない
-  // (チャット欄を HTML 文字列で埋めないため)。
-  return [
-    "シードドキュメントから reveal.js スライドを生成してください。",
-    "",
-    `**Write ツールで以下の絶対パスにファイル全体を書き込んでください**: ${slidesEntry}`,
-    "",
-    "テンプレート (この形を厳守。head/script の dist/ 参照は維持):",
-    "```html",
-    "<!DOCTYPE html>",
-    '<html lang="ja">',
-    "<head>",
-    '  <meta charset="utf-8">',
-    '  <meta name="viewport" content="width=device-width, initial-scale=1">',
-    "  <title>...</title>",
-    '  <link rel="stylesheet" href="dist/reset.css">',
-    '  <link rel="stylesheet" href="dist/reveal.css">',
-    '  <link rel="stylesheet" href="dist/theme/black.css">',
-    "</head>",
-    "<body>",
-    '  <div class="reveal"><div class="slides">',
-    "    <section>...</section>  <!-- タイトル + 本編 + まとめで 5 枚以上 -->",
-    "  </div></div>",
-    '  <script src="dist/reveal.js"></script>',
-    "  <script>Reveal.initialize({hash:false});</script>",
-    "</body></html>",
-    "```",
-    "",
-    "**チャット欄での応答は完了報告のみ** (例: 「7 枚のスライドを生成しました」)。",
-    "**HTML 本文をチャットに貼り付けないでください**。Write ツールの結果だけで十分です。",
-    "",
-    "シード:",
-    seedContent,
-  ].join("\n");
-}
-
 async function generateSlides(
   win: BrowserWindow,
   bridge: ChatBridge | null,
@@ -269,6 +248,7 @@ async function generateSlides(
   project: Project | null,
   transcript: TranscriptLoggerLike,
   seedContent: string,
+  rubric?: DeckRubric | null,
 ): Promise<void> {
   if (!bridge || !activeSession) {
     void warn("generate_skipped_no_session", "reason=session_not_initialized");
@@ -302,7 +282,7 @@ async function generateSlides(
       parts: [
         {
           type: "text",
-          text: buildGeneratePrompt(project.slidesEntry, seedContent),
+          text: buildGeneratePrompt(project.slidesEntry, seedContent, rubric),
         },
       ],
     });
@@ -430,6 +410,21 @@ interface ApiKeyHandlers {
   onOpenSignupUrl: () => void;
 }
 
+interface InterviewHandlers {
+  start(seedContent: string): void | Promise<void>;
+  answer(args: { turnIndex: number; answer: string }): void | Promise<void>;
+  cancel(): void | Promise<void>;
+  skip(seedContent: string): void | Promise<void>;
+  listPresets(): void | Promise<void>;
+  usePreset(presetId: string): void | Promise<void>;
+  confirmRubric(args: {
+    rubric: DeckRubric;
+    seed: string;
+    alsoSavePreset: boolean;
+    presetName?: string;
+  }): void | Promise<void>;
+}
+
 function attachHandlers(
   win: BrowserWindow,
   getActiveProject: () => Project | null,
@@ -438,6 +433,7 @@ function attachHandlers(
   transcript: TranscriptLoggerLike,
   apiKeyHandlers: ApiKeyHandlers,
   templateRoot: string,
+  interviewHandlers: InterviewHandlers,
 ): void {
   win.on("host-message", (event: unknown) => {
     try {
@@ -576,6 +572,53 @@ function attachHandlers(
         );
         return;
       }
+
+      // T019 — interview / rubric / preset 経路
+      if (msg.type === "list-presets") {
+        void interviewHandlers.listPresets();
+        return;
+      }
+
+      if (msg.type === "use-preset") {
+        void interviewHandlers.usePreset(msg.presetId);
+        return;
+      }
+
+      if (msg.type === "interview-start") {
+        void interviewHandlers.start(msg.seedContent);
+        return;
+      }
+
+      if (msg.type === "interview-skip") {
+        void interviewHandlers.skip(msg.seedContent);
+        return;
+      }
+
+      if (msg.type === "interview-answer") {
+        void interviewHandlers.answer({
+          turnIndex: msg.turnIndex,
+          answer: msg.answer,
+        });
+        return;
+      }
+
+      if (msg.type === "interview-cancel") {
+        void interviewHandlers.cancel();
+        return;
+      }
+
+      if (msg.type === "rubric-confirm") {
+        const confirmArgs: Parameters<InterviewHandlers["confirmRubric"]>[0] = {
+          rubric: msg.rubric,
+          seed: msg.seedContent,
+          alsoSavePreset: msg.alsoSavePreset,
+        };
+        if (msg.presetName !== undefined) {
+          confirmArgs.presetName = msg.presetName;
+        }
+        void interviewHandlers.confirmRubric(confirmArgs);
+        return;
+      }
     } catch (err) {
       void logError("host_message_handler_failed", fmtErr(err));
       transcript.error("slaido_host_message_failed", err);
@@ -605,9 +648,12 @@ async function determineProjectMode(project: Project): Promise<"seed" | "chat"> 
 async function bootstrap(): Promise<void> {
   const projectsRoot = getProjectsRoot();
   const templateRoot = getBundledTemplateRoot();
-  void log("paths_resolved", `projectsRoot=${projectsRoot} templateRoot=${templateRoot}`);
+  const presetsRoot = getRubricPresetsRoot();
+  void log("paths_resolved", `projectsRoot=${projectsRoot} templateRoot=${templateRoot} presetsRoot=${presetsRoot}`);
 
   const store = new ProjectStore(projectsRoot, templateRoot);
+  const rubricStore = new RubricStore(projectsRoot);
+  const presetStore = new PresetStore(presetsRoot);
   let activeProject: Project | null = null;
   let activeManager: OpencodeServerManager | null = null;
   let activeBridge: ChatBridge | null = null;
@@ -615,6 +661,8 @@ async function bootstrap(): Promise<void> {
   let activePreviewSync: PreviewSync | null = null;
   let projectModeSent = false;
   const keychain = new KeychainAdapter();
+  // T019 Risk 5.4: interview 用 session id を持ち、bridge.onEvent から除外する.
+  const interviewSessionIds = new Set<string>();
 
   // TranscriptLogger は bootstrap 冒頭で 1 度だけ構築する。
   // chat-bridge がまだ無い時点 (= 起動直後) でも `slaido_started` を撃ちたいので,
@@ -802,6 +850,11 @@ async function bootstrap(): Promise<void> {
     // ChatBridge を初期化 (server 起動成功後)
     const bridge = new ChatBridge();
     bridge.onEvent((ev) => {
+      // T019 Risk 5.4: interview 用 session の event は WebView (chat タブ) に転送しない.
+      // chat-bridge は subscribe を 1 本で全 session の event を集約する設計のため、
+      // ここで session id ベースに filter する.
+      const sid = (ev as { sessionId?: unknown }).sessionId;
+      if (typeof sid === "string" && interviewSessionIds.has(sid)) return;
       sendToWebView(win, { type: "chat-event", event: ev });
     });
 
@@ -889,6 +942,53 @@ async function bootstrap(): Promise<void> {
     return true;
   }
 
+  // T019 — interview / rubric / preset orchestration
+  const orchestrator = new InterviewOrchestrator({
+    getServerInfo: () => activeManager?.getInfo() ?? null,
+    send: (msg) => sendToWebView(win, msg),
+    rubricStore,
+    presetStore,
+    interviewSessionIds,
+    getActiveProjectId: () => activeProject?.meta.id ?? null,
+    onRubricConfirmed: async ({ rubric, seed }) => {
+      await generateSlides(
+        win,
+        activeBridge,
+        activeSession,
+        activeProject,
+        transcript,
+        seed,
+        rubric,
+      );
+    },
+    warn: (event, detail) => warn(event, detail ?? ""),
+  });
+
+  const interviewHandlers: InterviewHandlers = {
+    start: (seedContent) => orchestrator.start(seedContent),
+    answer: (args) => orchestrator.answer(args),
+    cancel: () => orchestrator.cancel(),
+    skip: async (seedContent) => {
+      // 空 rubric で生成 (interview を経由しない)
+      await generateSlides(
+        win,
+        activeBridge,
+        activeSession,
+        activeProject,
+        transcript,
+        seedContent,
+        null,
+      );
+    },
+    listPresets: () => orchestrator.listPresets(),
+    usePreset: async (presetId) => {
+      // mainview 側で preset.rubric を draftRubric に乗せて rubric-confirm まで進める設計.
+      // bun 側ではログだけ残す (将来 "最近使った preset" の統計を取るためのフック).
+      void log("interview_use_preset", `presetId=${presetId}`);
+    },
+    confirmRubric: (args) => orchestrator.confirmRubric(args),
+  };
+
   attachHandlers(
     win,
     () => activeProject,
@@ -949,6 +1049,7 @@ async function bootstrap(): Promise<void> {
       },
     },
     templateRoot,
+    interviewHandlers,
   );
 
   win.webview.on("dom-ready", async () => {

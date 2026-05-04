@@ -271,17 +271,35 @@
       cursor: pointer;
     }
 
-    /* シードモード / チャットモード切替 (R-1) */
-    body[data-seed-mode="loading"] #seed-area,
-    body[data-seed-mode="loading"] #chat-input-area {
+    /* phase 切替 (R-1 + T019). data-phase: loading | seed | interview | rubric-edit | chat */
+    body[data-phase="loading"] #seed-area,
+    body[data-phase="loading"] #chat-input-area,
+    body[data-phase="loading"] #interview-pane,
+    body[data-phase="loading"] #rubric-edit-pane {
       display: none;
     }
 
-    body[data-seed-mode="seed"] #chat-input-area {
+    body[data-phase="seed"] #chat-input-area,
+    body[data-phase="seed"] #interview-pane,
+    body[data-phase="seed"] #rubric-edit-pane {
       display: none;
     }
 
-    body[data-seed-mode="chat"] #seed-area {
+    body[data-phase="interview"] #seed-area,
+    body[data-phase="interview"] #chat-input-area,
+    body[data-phase="interview"] #rubric-edit-pane {
+      display: none;
+    }
+
+    body[data-phase="rubric-edit"] #seed-area,
+    body[data-phase="rubric-edit"] #chat-input-area,
+    body[data-phase="rubric-edit"] #interview-pane {
+      display: none;
+    }
+
+    body[data-phase="chat"] #seed-area,
+    body[data-phase="chat"] #interview-pane,
+    body[data-phase="chat"] #rubric-edit-pane {
       display: none;
     }
 
@@ -292,8 +310,10 @@
       flex-shrink: 0;
     }
 
-    body[data-seed-mode="seed"] #chat-tabs,
-    body[data-seed-mode="loading"] #chat-tabs {
+    body[data-phase="seed"] #chat-tabs,
+    body[data-phase="loading"] #chat-tabs,
+    body[data-phase="interview"] #chat-tabs,
+    body[data-phase="rubric-edit"] #chat-tabs {
       display: none;
     }
 
@@ -422,6 +442,9 @@
       padding: 12px 16px;
       border-top: 1px solid #2d2d4e;
       flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
     }
 
     #seed-label {
@@ -430,6 +453,331 @@
       margin-bottom: 6px;
       text-transform: uppercase;
       letter-spacing: 0.5px;
+    }
+
+    #preset-select-wrap {
+      font-size: 12px;
+      color: #888;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    #preset-select-wrap.hidden {
+      display: none;
+    }
+
+    #preset-select {
+      flex: 1;
+      background: #0d0d1a;
+      border: 1px solid #2d2d4e;
+      color: #c0c8d4;
+      border-radius: 6px;
+      padding: 4px 6px;
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    #generate-skip-link {
+      align-self: flex-end;
+      background: transparent;
+      border: none;
+      color: #888;
+      font-size: 11px;
+      text-decoration: underline;
+      cursor: pointer;
+      padding: 2px 4px;
+      font-family: inherit;
+    }
+
+    #generate-skip-link:hover {
+      color: #a0c4ff;
+    }
+
+    /* interview pane */
+    #interview-pane {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: #16213e;
+    }
+
+    .interview-progress {
+      font-size: 11px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .interview-question {
+      background: #2d2d4e;
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+      color: #e0e0e0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .interview-question.loading {
+      color: #888;
+      font-style: italic;
+    }
+
+    .interview-history {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .interview-history-item {
+      font-size: 12px;
+      color: #aab1bf;
+    }
+
+    .interview-history-item .q {
+      color: #888;
+    }
+
+    .interview-history-item .a {
+      color: #c0c8d4;
+      padding-left: 12px;
+      white-space: pre-wrap;
+    }
+
+    #interview-answer-input {
+      width: 100%;
+      min-height: 80px;
+      background: #0d0d1a;
+      border: 1px solid #2d2d4e;
+      border-radius: 8px;
+      color: #e0e0e0;
+      font-size: 13px;
+      padding: 8px 12px;
+      resize: vertical;
+      font-family: inherit;
+    }
+
+    #interview-answer-input:focus {
+      outline: none;
+      border-color: #a0c4ff;
+    }
+
+    .interview-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    #interview-answer-submit {
+      flex: 1;
+      padding: 10px;
+      background: #a0c4ff;
+      color: #0d0d1a;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    #interview-answer-submit:disabled {
+      background: #2d2d4e;
+      color: #555;
+      cursor: not-allowed;
+    }
+
+    #interview-cancel-btn {
+      background: transparent;
+      color: #888;
+      border: 1px solid #2d2d4e;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    #interview-cancel-btn:hover {
+      color: #ff8080;
+      border-color: #ff8080;
+    }
+
+    .interview-error {
+      background: #4a1a1a;
+      color: #ff8080;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+
+    .interview-error.hidden {
+      display: none;
+    }
+
+    /* rubric-edit pane */
+    #rubric-edit-pane {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: #16213e;
+    }
+
+    .rubric-edit-title {
+      font-size: 13px;
+      color: #a0c4ff;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .rubric-edit-desc {
+      font-size: 12px;
+      color: #888;
+      line-height: 1.5;
+      margin-bottom: 8px;
+    }
+
+    .rubric-axis {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .rubric-axis label {
+      font-size: 11px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .rubric-axis input[type="text"],
+    .rubric-axis input[type="number"],
+    .rubric-axis textarea,
+    .rubric-axis select {
+      background: #0d0d1a;
+      border: 1px solid #2d2d4e;
+      border-radius: 6px;
+      color: #e0e0e0;
+      font-size: 13px;
+      padding: 6px 10px;
+      font-family: inherit;
+    }
+
+    .rubric-axis textarea {
+      min-height: 50px;
+      resize: vertical;
+    }
+
+    .rubric-axis input:focus,
+    .rubric-axis textarea:focus,
+    .rubric-axis select:focus {
+      outline: none;
+      border-color: #a0c4ff;
+    }
+
+    .rubric-axis-anti-patterns {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .rubric-axis-anti-patterns .item {
+      display: flex;
+      gap: 4px;
+    }
+
+    .rubric-axis-anti-patterns input[type="text"] {
+      flex: 1;
+    }
+
+    .rubric-axis-anti-patterns button {
+      background: transparent;
+      border: 1px solid #2d2d4e;
+      color: #888;
+      border-radius: 6px;
+      padding: 2px 8px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .rubric-axis-anti-patterns button:hover {
+      color: #ff8080;
+      border-color: #ff8080;
+    }
+
+    .rubric-axis-anti-patterns .add-btn {
+      align-self: flex-start;
+      color: #a0c4ff;
+    }
+
+    .rubric-axis-anti-patterns .add-btn:hover {
+      color: #bfd7ff;
+      border-color: #a0c4ff;
+    }
+
+    .rubric-history {
+      border-top: 1px dashed #2d2d4e;
+      padding-top: 8px;
+      margin-top: 4px;
+    }
+
+    .rubric-history summary {
+      font-size: 11px;
+      color: #888;
+      cursor: pointer;
+    }
+
+    .rubric-history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 6px;
+      font-size: 12px;
+      color: #aab1bf;
+    }
+
+    .rubric-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    .rubric-actions button {
+      flex: 1;
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    #rubric-generate-btn {
+      background: #a0c4ff;
+      color: #0d0d1a;
+      border: none;
+    }
+
+    #rubric-save-and-generate-btn {
+      background: transparent;
+      color: #a0c4ff;
+      border: 1px solid #a0c4ff;
+    }
+
+    #rubric-cancel-btn {
+      background: transparent;
+      color: #888;
+      border: 1px solid #2d2d4e;
+      flex: 0 0 80px;
     }
 
     #seed-input {
@@ -771,10 +1119,46 @@
         <div id="dev-raw-trail-list"></div>
       </div>
 
+      <div id="interview-pane">
+        <div class="interview-progress" id="interview-progress"></div>
+        <div class="interview-history" id="interview-history"></div>
+        <div class="interview-question" id="interview-question"></div>
+        <div class="interview-error hidden" id="interview-error"></div>
+        <textarea id="interview-answer-input" placeholder="回答を入力してください..."></textarea>
+        <div class="interview-actions">
+          <button id="interview-answer-submit" type="button">送信して次の質問へ</button>
+          <button id="interview-cancel-btn" type="button">中断</button>
+        </div>
+      </div>
+
+      <div id="rubric-edit-pane">
+        <div class="rubric-edit-title">このスライドの前提条件 (rubric)</div>
+        <div class="rubric-edit-desc">
+          編集してから「このまま生成」を押すか、「保存して再利用」で次回以降に流用できます。
+        </div>
+        <div id="rubric-edit-form"></div>
+        <details class="rubric-history">
+          <summary>インタビュー履歴を見る</summary>
+          <div class="rubric-history-list" id="rubric-history-list"></div>
+        </details>
+        <div class="rubric-actions">
+          <button id="rubric-generate-btn" type="button">このまま生成</button>
+          <button id="rubric-save-and-generate-btn" type="button">保存して再利用</button>
+          <button id="rubric-cancel-btn" type="button">破棄</button>
+        </div>
+      </div>
+
       <div id="seed-area">
         <div id="seed-label">シードドキュメント</div>
+        <div id="preset-select-wrap" class="hidden">
+          <span>過去の rubric を流用</span>
+          <select id="preset-select">
+            <option value="">— 選択しない —</option>
+          </select>
+        </div>
         <textarea id="seed-input" placeholder="ドキュメント、アウトライン、メモなどを貼り付けてください..."></textarea>
         <button id="generate-btn">スライドを生成</button>
+        <button id="generate-skip-link" type="button">インタビューをスキップして生成</button>
       </div>
 
       <div id="chat-input-area">

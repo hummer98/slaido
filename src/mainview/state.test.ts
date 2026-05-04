@@ -6,6 +6,24 @@ import { describe, expect, test } from "bun:test";
 
 import { initialState, reduce, toolLabel } from "./state";
 import type { ChatLogState } from "./state";
+import type { DeckRubric } from "../bun/storage/rubric-types";
+
+function buildRubric(): DeckRubric {
+  return {
+    schemaVersion: 1,
+    axes: {
+      audience: "x",
+      duration_min: 10,
+      purpose: "教育",
+      success_criteria: null,
+      tone: null,
+      anti_patterns: [],
+    },
+    raw_interview_log: [],
+    createdAt: "2026-05-04T00:00:00.000Z",
+    updatedAt: "2026-05-04T00:00:00.000Z",
+  };
+}
 import type {
   ChatEvent,
   ChatEventError,
@@ -493,5 +511,177 @@ describe("reduce / immutability", () => {
     expect(s0.messages).toHaveLength(0);
     expect(s1.messages).toHaveLength(1);
     expect(s0).not.toBe(s1);
+  });
+});
+
+// T019 — interview reducer (plan §S7)
+describe("reduce / interview-start-requested", () => {
+  test("seedMode=false 遷移 / interview state を生成 / seedDocument 保持", () => {
+    const s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "シード本文",
+    });
+    expect(s.seedMode).toBe(false);
+    expect(s.seedDocument).toBe("シード本文");
+    expect(s.interview).not.toBeNull();
+    expect(s.interview?.phase).toBe("asking");
+    expect(s.interview?.pendingQuestion).toBeNull();
+    expect(s.interview?.log).toEqual([]);
+  });
+
+  test("turn は触らない (interview は chat turn と独立)", () => {
+    const s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    expect(s.turn).toBe("idle");
+  });
+});
+
+describe("reduce / interview-question-received", () => {
+  test("pendingQuestion をセットし phase=asking", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    s = reduce(s, {
+      type: "interview-question-received",
+      turnIndex: 0,
+      question: "誰に話しますか？",
+      askedCount: 1,
+      maxQuestions: 4,
+    });
+    expect(s.interview?.pendingQuestion?.question).toBe("誰に話しますか？");
+    expect(s.interview?.pendingQuestion?.turnIndex).toBe(0);
+    expect(s.interview?.phase).toBe("asking");
+  });
+
+  test("interview 未開始の場合は無視 (state そのまま)", () => {
+    const s0 = initialState(true);
+    const s1 = reduce(s0, {
+      type: "interview-question-received",
+      turnIndex: 0,
+      question: "x",
+      askedCount: 1,
+      maxQuestions: 4,
+    });
+    expect(s1.interview).toBeNull();
+  });
+});
+
+describe("reduce / interview-answer-submitted", () => {
+  test("answer を log に積み pendingQuestion を null に戻す", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    s = reduce(s, {
+      type: "interview-question-received",
+      turnIndex: 0,
+      question: "Q1",
+      askedCount: 1,
+      maxQuestions: 4,
+    });
+    s = reduce(s, { type: "interview-answer-submitted", answer: "A1" });
+    expect(s.interview?.log).toEqual([{ q: "Q1", a: "A1" }]);
+    expect(s.interview?.pendingQuestion).toBeNull();
+  });
+
+  test("pendingQuestion が無いときは no-op", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    const before = s;
+    s = reduce(s, { type: "interview-answer-submitted", answer: "A1" });
+    expect(s).toBe(before);
+  });
+});
+
+describe("reduce / interview-finished", () => {
+  test("phase=rubric-edit に遷移し draftRubric をセット", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    s = reduce(s, { type: "interview-finished", rubric: buildRubric() });
+    expect(s.interview?.phase).toBe("rubric-edit");
+    expect(s.interview?.draftRubric).toEqual(buildRubric());
+  });
+});
+
+describe("reduce / interview-cancelled", () => {
+  test("interview を畳んで seedMode=true に戻す", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    s = reduce(s, { type: "interview-cancelled" });
+    expect(s.interview).toBeNull();
+    expect(s.seedMode).toBe(true);
+  });
+});
+
+describe("reduce / interview-error", () => {
+  test("interview state.error にメッセージを格納", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    s = reduce(s, { type: "interview-error", message: "AI 失敗" });
+    expect(s.interview?.error).toBe("AI 失敗");
+  });
+});
+
+describe("reduce / rubric-edit-changed", () => {
+  test("draftRubric を上書きする", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    s = reduce(s, { type: "interview-finished", rubric: buildRubric() });
+    const updated: DeckRubric = {
+      ...buildRubric(),
+      axes: { ...buildRubric().axes, audience: "新規顧客" },
+    };
+    s = reduce(s, { type: "rubric-edit-changed", rubric: updated });
+    expect(s.interview?.draftRubric?.axes.audience).toBe("新規顧客");
+  });
+});
+
+describe("reduce / preset-list-received", () => {
+  test("presets を上書き", () => {
+    const presets = [
+      { id: "p1", name: "x", rubric: buildRubric(), createdAt: "2026-05-04T00:00:00.000Z" },
+    ];
+    const s = reduce(initialState(true), {
+      type: "preset-list-received",
+      presets,
+    });
+    expect(s.presets).toEqual(presets);
+  });
+});
+
+describe("reduce / preset-use-requested", () => {
+  test("interview state を畳む (preset 流用は interview を介さない)", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    s = reduce(s, { type: "preset-use-requested", presetId: "p1" });
+    expect(s.interview).toBeNull();
+  });
+});
+
+describe("reduce / seed-generate (役割再定義)", () => {
+  test("seed-generate は interview を経由しない経路で interview を畳む", () => {
+    let s = reduce(initialState(true), {
+      type: "interview-start-requested",
+      seed: "x",
+    });
+    expect(s.interview).not.toBeNull();
+    s = reduce(s, { type: "seed-generate", seed: "x" });
+    expect(s.interview).toBeNull();
+    expect(s.seedMode).toBe(false);
   });
 });

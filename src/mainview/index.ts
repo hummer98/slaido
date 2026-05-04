@@ -19,11 +19,17 @@ new Electroview({
 
 import type { ChatEvent } from "../bun/opencode";
 import {
+  AXIS_LABELS_JA,
+  type DeckRubric,
+  type RubricPreset,
+} from "../bun/storage/rubric-types";
+import {
   initialState,
   reduce,
   toolLabel,
   type Action,
   type ChatLogState,
+  type InterviewState,
   type MessageNode,
   type PermissionPrompt,
 } from "./state";
@@ -58,6 +64,17 @@ type ServerMessage =
   | { type: "request-api-key" }
   | { type: "api-key-validated" }
   | { type: "api-key-error"; reason: ApiKeyErrorReason; message?: string }
+  | { type: "presets-list"; presets: RubricPreset[] }
+  | {
+      type: "interview-question";
+      turnIndex: number;
+      question: string;
+      askedCount: number;
+      maxQuestions: number;
+    }
+  | { type: "interview-done"; rubric: DeckRubric }
+  | { type: "interview-error"; message: string }
+  | { type: "preset-saved"; preset: RubricPreset }
   | ExportProgressMessage;
 
 declare global {
@@ -90,6 +107,26 @@ const apiKeyResetLink = document.getElementById("api-key-reset-link") as HTMLBut
 
 const exportPdfBtn = document.getElementById("export-pdf-btn") as HTMLButtonElement;
 const exportHtmlZipBtn = document.getElementById("export-html-zip-btn") as HTMLButtonElement;
+
+const generateSkipLink = document.getElementById("generate-skip-link") as HTMLButtonElement;
+const presetSelectWrap = document.getElementById("preset-select-wrap") as HTMLDivElement;
+const presetSelect = document.getElementById("preset-select") as HTMLSelectElement;
+
+const interviewProgress = document.getElementById("interview-progress") as HTMLDivElement;
+const interviewHistory = document.getElementById("interview-history") as HTMLDivElement;
+const interviewQuestion = document.getElementById("interview-question") as HTMLDivElement;
+const interviewError = document.getElementById("interview-error") as HTMLDivElement;
+const interviewAnswerInput = document.getElementById("interview-answer-input") as HTMLTextAreaElement;
+const interviewAnswerSubmit = document.getElementById("interview-answer-submit") as HTMLButtonElement;
+const interviewCancelBtn = document.getElementById("interview-cancel-btn") as HTMLButtonElement;
+
+const rubricEditForm = document.getElementById("rubric-edit-form") as HTMLDivElement;
+const rubricHistoryList = document.getElementById("rubric-history-list") as HTMLDivElement;
+const rubricGenerateBtn = document.getElementById("rubric-generate-btn") as HTMLButtonElement;
+const rubricSaveAndGenerateBtn = document.getElementById("rubric-save-and-generate-btn") as HTMLButtonElement;
+const rubricCancelBtn = document.getElementById("rubric-cancel-btn") as HTMLButtonElement;
+
+const PURPOSE_OPTIONS = ["", "説得", "共有", "教育", "提案承認"] as const;
 
 const EXPORT_LABELS: Record<ExportKind, { idle: string; running: string }> = {
   pdf: { idle: "PDF として保存", running: "PDF 作成中..." },
@@ -129,13 +166,26 @@ function scheduleRender(): void {
 }
 
 function render(): void {
-  applySeedModeClass();
+  applyPhaseClass();
   renderMessages();
   renderSeedDisplay();
   renderInputArea();
+  renderPresetSelect();
+  renderInterviewPane();
+  renderRubricEditPane();
   if (isDevMode()) {
     renderDevRawTrail();
   }
+}
+
+type Phase = "loading" | "seed" | "interview" | "rubric-edit" | "chat";
+
+function derivePhase(s: ChatLogState): Phase {
+  if (s.seedMode === null) return "loading";
+  if (s.interview?.phase === "rubric-edit") return "rubric-edit";
+  if (s.interview?.phase === "asking") return "interview";
+  if (s.seedMode === true) return "seed";
+  return "chat";
 }
 
 function renderSeedDisplay(): void {
@@ -172,10 +222,8 @@ chatTabs.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((btn) => {
   });
 });
 
-function applySeedModeClass(): void {
-  const mode =
-    state.seedMode === null ? "loading" : state.seedMode ? "seed" : "chat";
-  document.body.dataset["seedMode"] = mode;
+function applyPhaseClass(): void {
+  document.body.dataset["phase"] = derivePhase(state);
 }
 
 function renderInputArea(): void {
@@ -430,6 +478,237 @@ function renderPermissionPrompt(el: HTMLElement, prompt: PermissionPrompt): void
   });
 }
 
+function renderPresetSelect(): void {
+  if (state.presets.length === 0) {
+    presetSelectWrap.classList.add("hidden");
+    return;
+  }
+  presetSelectWrap.classList.remove("hidden");
+  // 既存の "選択しない" だけ残し、ほかを全部洗い替え (id 衝突しないので破壊的に)
+  while (presetSelect.options.length > 1) {
+    presetSelect.remove(1);
+  }
+  for (const p of state.presets) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.name;
+    presetSelect.appendChild(opt);
+  }
+}
+
+function renderInterviewPane(): void {
+  const iv = state.interview;
+  if (!iv) {
+    interviewQuestion.textContent = "";
+    interviewAnswerInput.value = "";
+    return;
+  }
+  // 進捗表示: x / max
+  if (iv.pendingQuestion) {
+    interviewProgress.textContent =
+      `Q${iv.pendingQuestion.askedCount} / 最大 ${iv.pendingQuestion.maxQuestions}`;
+  } else {
+    interviewProgress.textContent = "次の質問を生成中...";
+  }
+  // 質問本文 (textContent で書く — XSS 防止)
+  if (iv.pendingQuestion) {
+    interviewQuestion.classList.remove("loading");
+    interviewQuestion.textContent = iv.pendingQuestion.question;
+    interviewAnswerSubmit.disabled = false;
+  } else {
+    interviewQuestion.classList.add("loading");
+    interviewQuestion.textContent = "...";
+    interviewAnswerSubmit.disabled = true;
+  }
+  // 履歴 (textContent で q / a を書く — XSS 防止 / D7 / Risk 5.6)
+  interviewHistory.textContent = "";
+  for (const item of iv.log) {
+    const wrap = document.createElement("div");
+    wrap.className = "interview-history-item";
+    const q = document.createElement("div");
+    q.className = "q";
+    q.textContent = `Q: ${item.q}`;
+    const a = document.createElement("div");
+    a.className = "a";
+    a.textContent = `→ ${item.a}`;
+    wrap.appendChild(q);
+    wrap.appendChild(a);
+    interviewHistory.appendChild(wrap);
+  }
+  // error 表示
+  if (iv.error) {
+    interviewError.classList.remove("hidden");
+    interviewError.textContent = iv.error;
+  } else {
+    interviewError.classList.add("hidden");
+    interviewError.textContent = "";
+  }
+}
+
+function renderRubricEditPane(): void {
+  const iv = state.interview;
+  if (!iv || iv.phase !== "rubric-edit" || !iv.draftRubric) {
+    return;
+  }
+  const rubric = iv.draftRubric;
+  // 軸ごとに input 要素を組み立てる. textContent で label を書く.
+  rubricEditForm.textContent = "";
+  rubricEditForm.appendChild(buildAxisRow("audience", rubric));
+  rubricEditForm.appendChild(buildAxisRow("duration_min", rubric));
+  rubricEditForm.appendChild(buildAxisRow("purpose", rubric));
+  rubricEditForm.appendChild(buildAxisRow("success_criteria", rubric));
+  rubricEditForm.appendChild(buildAxisRow("tone", rubric));
+  rubricEditForm.appendChild(buildAntiPatternsRow(rubric));
+
+  // history (raw_interview_log は textContent 経由で render する — XSS 防止 / D7)
+  rubricHistoryList.textContent = "";
+  for (const turn of rubric.raw_interview_log) {
+    const item = document.createElement("div");
+    const q = document.createElement("div");
+    q.textContent = `Q: ${turn.q}`;
+    const a = document.createElement("div");
+    a.textContent = `→ ${turn.a}`;
+    item.appendChild(q);
+    item.appendChild(a);
+    rubricHistoryList.appendChild(item);
+  }
+}
+
+function buildAxisRow(
+  key: "audience" | "duration_min" | "purpose" | "success_criteria" | "tone",
+  rubric: DeckRubric,
+): HTMLDivElement {
+  const wrap = document.createElement("div");
+  wrap.className = "rubric-axis";
+  const label = document.createElement("label");
+  label.textContent = AXIS_LABELS_JA[key] ?? key;
+  wrap.appendChild(label);
+
+  if (key === "purpose") {
+    const select = document.createElement("select");
+    for (const v of PURPOSE_OPTIONS) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = v === "" ? "—" : v;
+      select.appendChild(opt);
+    }
+    select.value = rubric.axes.purpose ?? "";
+    select.addEventListener("change", () => {
+      const value = select.value;
+      const next: DeckRubric = {
+        ...rubric,
+        axes: {
+          ...rubric.axes,
+          purpose:
+            value === "説得" ||
+            value === "共有" ||
+            value === "教育" ||
+            value === "提案承認"
+              ? value
+              : null,
+        },
+      };
+      dispatch({ type: "rubric-edit-changed", rubric: next });
+    });
+    wrap.appendChild(select);
+    return wrap;
+  }
+
+  if (key === "duration_min") {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = "1";
+    input.step = "1";
+    input.value =
+      rubric.axes.duration_min !== null ? String(rubric.axes.duration_min) : "";
+    input.addEventListener("input", () => {
+      const num = Number.parseInt(input.value, 10);
+      const next: DeckRubric = {
+        ...rubric,
+        axes: {
+          ...rubric.axes,
+          duration_min: Number.isFinite(num) && num > 0 ? num : null,
+        },
+      };
+      dispatch({ type: "rubric-edit-changed", rubric: next });
+    });
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  // audience / success_criteria / tone は textarea
+  const textarea = document.createElement("textarea");
+  textarea.value = (rubric.axes as Record<string, unknown>)[key] as string ?? "";
+  textarea.addEventListener("input", () => {
+    const value = textarea.value;
+    const next: DeckRubric = {
+      ...rubric,
+      axes: {
+        ...rubric.axes,
+        [key]: value === "" ? null : value,
+      } as DeckRubric["axes"],
+    };
+    dispatch({ type: "rubric-edit-changed", rubric: next });
+  });
+  wrap.appendChild(textarea);
+  return wrap;
+}
+
+function buildAntiPatternsRow(rubric: DeckRubric): HTMLDivElement {
+  const wrap = document.createElement("div");
+  wrap.className = "rubric-axis";
+  const label = document.createElement("label");
+  label.textContent = AXIS_LABELS_JA["anti_patterns"] ?? "anti_patterns";
+  wrap.appendChild(label);
+  const list = document.createElement("div");
+  list.className = "rubric-axis-anti-patterns";
+
+  const items = rubric.axes.anti_patterns;
+
+  function update(next: string[]): void {
+    const updated: DeckRubric = {
+      ...rubric,
+      axes: { ...rubric.axes, anti_patterns: next },
+    };
+    dispatch({ type: "rubric-edit-changed", rubric: updated });
+  }
+
+  for (let i = 0; i < items.length; i++) {
+    const row = document.createElement("div");
+    row.className = "item";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = items[i] ?? "";
+    input.addEventListener("input", () => {
+      const next = items.slice();
+      next[i] = input.value;
+      update(next);
+    });
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.textContent = "削除";
+    removeBtn.addEventListener("click", () => {
+      const next = items.slice();
+      next.splice(i, 1);
+      update(next);
+    });
+    row.appendChild(input);
+    row.appendChild(removeBtn);
+    list.appendChild(row);
+  }
+
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.className = "add-btn";
+  addBtn.textContent = "+ 追加";
+  addBtn.addEventListener("click", () => {
+    update([...items, ""]);
+  });
+  list.appendChild(addBtn);
+  wrap.appendChild(list);
+  return wrap;
+}
+
 function renderDevRawTrail(): void {
   if (!devRawTrailList) return;
   // 増分のみ追加 (rawTrail は append-only)
@@ -614,6 +893,41 @@ window.__SLAIDO_RECEIVE__ = (msg: ServerMessage): void => {
     handleExportProgress(msg);
     return;
   }
+
+  if (msg.type === "presets-list") {
+    dispatch({ type: "preset-list-received", presets: msg.presets });
+    return;
+  }
+
+  if (msg.type === "interview-question") {
+    dispatch({
+      type: "interview-question-received",
+      turnIndex: msg.turnIndex,
+      question: msg.question,
+      askedCount: msg.askedCount,
+      maxQuestions: msg.maxQuestions,
+    });
+    return;
+  }
+
+  if (msg.type === "interview-done") {
+    dispatch({ type: "interview-finished", rubric: msg.rubric });
+    return;
+  }
+
+  if (msg.type === "interview-error") {
+    dispatch({ type: "interview-error", message: msg.message });
+    return;
+  }
+
+  if (msg.type === "preset-saved") {
+    // 保存成功フィードバック: 単純に preset 一覧を更新する (bun 側からの再 list は
+    // orchestrator の責務. 既存 list が古い場合に備えてここでは挿入のみ).
+    const exists = state.presets.some((p) => p.id === msg.preset.id);
+    const next = exists ? state.presets : [msg.preset, ...state.presets];
+    dispatch({ type: "preset-list-received", presets: next });
+    return;
+  }
 };
 
 function updatePreviewStatusFromEvent(ev: ChatEvent): void {
@@ -676,10 +990,103 @@ generateBtn.addEventListener("click", () => {
     return;
   }
 
+  // T019 — default は interview 経路 (A004 §「skip が default にならないよう注意」).
+  dispatch({ type: "interview-start-requested", seed: seedContent });
+  __electrobunSendToHost({ type: "interview-start", seedContent });
+});
+
+generateSkipLink.addEventListener("click", () => {
+  const seedContent = seedInput.value.trim();
+  if (!seedContent || state.turn !== "idle") {
+    __electrobunSendToHost({
+      type: "client-warn",
+      event: "generate_skip_click_ignored",
+      detail: `seedLen=${seedContent.length} turn=${state.turn}`,
+    });
+    return;
+  }
+  // skip 経路: 空 rubric で即生成へ (interview を経由しない).
   dispatch({ type: "seed-generate", seed: seedContent });
   previewStatus.textContent = "生成中...";
+  __electrobunSendToHost({ type: "interview-skip", seedContent });
+});
 
-  __electrobunSendToHost({ type: "generate", seedContent });
+interviewAnswerSubmit.addEventListener("click", () => {
+  submitInterviewAnswer();
+});
+
+interviewCancelBtn.addEventListener("click", () => {
+  dispatch({ type: "interview-cancelled" });
+  __electrobunSendToHost({ type: "interview-cancel" });
+});
+
+function submitInterviewAnswer(): void {
+  if (!state.interview) return;
+  const q = state.interview.pendingQuestion;
+  if (!q) return;
+  const answer = interviewAnswerInput.value.trim();
+  if (!answer) return;
+  const turnIndex = q.turnIndex;
+  dispatch({ type: "interview-answer-submitted", answer });
+  interviewAnswerInput.value = "";
+  __electrobunSendToHost({ type: "interview-answer", turnIndex, answer });
+}
+
+rubricGenerateBtn.addEventListener("click", () => {
+  sendRubricConfirm({ savePreset: false });
+});
+
+rubricSaveAndGenerateBtn.addEventListener("click", () => {
+  if (!state.interview?.draftRubric) return;
+  const name = window.prompt("preset の名前を入力してください (空欄で取り消し)");
+  if (!name) return;
+  sendRubricConfirm({ savePreset: true, presetName: name });
+});
+
+rubricCancelBtn.addEventListener("click", () => {
+  dispatch({ type: "interview-cancelled" });
+  __electrobunSendToHost({ type: "interview-cancel" });
+});
+
+function sendRubricConfirm(opts: { savePreset: boolean; presetName?: string }): void {
+  const rubric = state.interview?.draftRubric;
+  if (!rubric) return;
+  // 確定後は seed-generate で interview を畳んで chat mode に遷移する.
+  // (turn=running まで進めるのは bun から chat-event が届いてから — 既存の generate
+  // 経路と同じハンドリングを保つため、ここでは seedDocument を保持しつつ interview
+  // を null に倒す seed-generate action を再利用する.)
+  const seed =
+    state.interview?.seed ?? state.seedDocument ?? seedInput.value.trim();
+  dispatch({ type: "seed-generate", seed });
+  previewStatus.textContent = "生成中...";
+  const payload: {
+    type: "rubric-confirm";
+    rubric: DeckRubric;
+    seedContent: string;
+    alsoSavePreset: boolean;
+    presetName?: string;
+  } = {
+    type: "rubric-confirm",
+    rubric,
+    seedContent: seed,
+    alsoSavePreset: opts.savePreset,
+  };
+  if (opts.presetName !== undefined) {
+    payload.presetName = opts.presetName;
+  }
+  __electrobunSendToHost(payload);
+}
+
+presetSelect.addEventListener("change", () => {
+  const id = presetSelect.value;
+  if (!id) return;
+  const preset = state.presets.find((p) => p.id === id);
+  if (!preset) return;
+  // mainview だけで完結: preset.rubric を draftRubric に乗せて rubric-edit 画面へ
+  dispatch({ type: "preset-use-requested", presetId: id });
+  dispatch({ type: "interview-finished", rubric: preset.rubric });
+  __electrobunSendToHost({ type: "use-preset", presetId: id });
+  presetSelect.value = "";
 });
 
 sendBtn.addEventListener("click", () => {
@@ -798,5 +1205,7 @@ applyDevModeAttribute();
 scheduleRender();
 
 __electrobunSendToHost({ type: "ready" });
+// preset 一覧は最初の起動時に一度だけ取得 (空なら preset-select は hidden のまま)
+__electrobunSendToHost({ type: "list-presets" });
 
 export {};

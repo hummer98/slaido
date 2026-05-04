@@ -3,6 +3,7 @@ import { join } from "node:path";
 import {
   getAppDataRoot,
   getProjectsRoot,
+  getRubricPresetsRoot,
   getLastOpenedFile,
   getBundledTemplateRoot,
 } from "./app-paths";
@@ -29,6 +30,22 @@ describe("app-paths", () => {
       const home = "/tmp/fake-home";
       expect(getProjectsRoot(home)).toBe(
         join(getAppDataRoot(home), "projects"),
+      );
+    });
+  });
+
+  describe("getRubricPresetsRoot", () => {
+    it("getAppDataRoot/rubric-presets を返す", () => {
+      const home = "/tmp/fake-home";
+      expect(getRubricPresetsRoot(home)).toBe(
+        join(getAppDataRoot(home), "rubric-presets"),
+      );
+    });
+
+    it("homeOverride を引き継いで完全パスを返す", () => {
+      const home = "/tmp/fake-home";
+      expect(getRubricPresetsRoot(home)).toBe(
+        join(home, "Library", "Application Support", "slAIdo", "rubric-presets"),
       );
     });
   });

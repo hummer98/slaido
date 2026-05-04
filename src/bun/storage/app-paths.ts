@@ -24,6 +24,10 @@ export function getProjectsRoot(homeOverride?: string): string {
   return join(getAppDataRoot(homeOverride), "projects");
 }
 
+export function getRubricPresetsRoot(homeOverride?: string): string {
+  return join(getAppDataRoot(homeOverride), "rubric-presets");
+}
+
 export function getLastOpenedFile(homeOverride?: string): string {
   return join(getAppDataRoot(homeOverride), "last-opened.json");
 }

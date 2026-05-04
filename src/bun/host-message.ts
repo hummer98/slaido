@@ -14,6 +14,7 @@
  */
 
 import { z } from "zod";
+import { DeckRubricSchema } from "./storage/rubric-types";
 
 export const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ready") }),
@@ -32,6 +33,35 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("client-warn"),
     event: z.string().min(1),
     detail: z.string().optional(),
+  }),
+  // T019 — interview / rubric / preset 経路 (plan §3.3)
+  z.object({ type: z.literal("list-presets") }),
+  z.object({ type: z.literal("use-preset"), presetId: z.string().min(1) }),
+  z.object({
+    type: z.literal("interview-start"),
+    seedContent: z.string(),
+  }),
+  z.object({
+    type: z.literal("interview-skip"),
+    seedContent: z.string(),
+  }),
+  z.object({
+    type: z.literal("interview-answer"),
+    turnIndex: z.number().int().nonnegative(),
+    answer: z.string(),
+  }),
+  z.object({ type: z.literal("interview-cancel") }),
+  z.object({
+    type: z.literal("rubric-confirm"),
+    rubric: DeckRubricSchema,
+    /**
+     * 確定 rubric とともに送る seed 本文 (mainview 側の seedDocument).
+     * orchestrator は seed を保持しないため client が毎回送る (skip / preset 流用経路でも
+     * 同様のフローで処理できるように). 空文字も許容.
+     */
+    seedContent: z.string(),
+    alsoSavePreset: z.boolean(),
+    presetName: z.string().min(1).optional(),
   }),
 ]);
 

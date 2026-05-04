@@ -19,6 +19,7 @@ import type {
   ChatEventToolStatus,
   OpencodeToolState,
 } from "../bun/opencode";
+import type { DeckRubric, RubricPreset } from "../bun/storage/rubric-types";
 
 export type Role = "user" | "assistant" | "error";
 
@@ -69,6 +70,37 @@ export interface PermissionPrompt {
   status: "pending" | "auto-allowed" | "user-allowed" | "user-denied";
 }
 
+/**
+ * interview phase ごとの UI 状態 (T019 plan §S7).
+ *
+ * - phase = "asking": 次の質問を待っている / 受け取って表示中
+ * - phase = "rubric-edit": interview が done になり、rubric を編集中
+ *
+ * interview を開始していない / skip / cancel された場合は ChatLogState.interview = null.
+ */
+export type InterviewPhase = "asking" | "rubric-edit";
+
+export interface InterviewQuestion {
+  turnIndex: number;
+  question: string;
+  askedCount: number;
+  maxQuestions: number;
+}
+
+export interface InterviewState {
+  phase: InterviewPhase;
+  /** 入力中シード (interview を再開する場合の参照用) */
+  seed: string;
+  /** 現在表示中の質問. answer 送信から次の question 受信までの間は null */
+  pendingQuestion: InterviewQuestion | null;
+  /** これまでの Q&A 履歴 (oldest first) */
+  log: Array<{ q: string; a: string }>;
+  /** interview が done してから rubric-confirm までの編集対象 rubric */
+  draftRubric: DeckRubric | null;
+  /** interview-error 表示用 */
+  error: string | null;
+}
+
 export interface ChatLogState {
   messages: MessageNode[];
   activeMessageId: string | null;
@@ -93,6 +125,14 @@ export interface ChatLogState {
    * lastUserInput は user-send で上書きされるため別フィールドで保持する必要がある。
    */
   seedDocument: string | null;
+  /**
+   * interview / rubric 編集中の状態. 未開始 / skip / cancel 時は null.
+   * interview-start-requested で生成され、interview-finished で phase=rubric-edit に進む.
+   * rubric-edit-changed で draftRubric が更新される. interview-cancelled で null に戻る.
+   */
+  interview: InterviewState | null;
+  /** preset 一覧 (bun から `presets-list` が届くと更新) */
+  presets: RubricPreset[];
 }
 
 export type Action =
@@ -100,10 +140,31 @@ export type Action =
   | { type: "chat-event"; event: ChatEvent }
   | { type: "permission-decide"; permissionId: string; allow: boolean }
   | { type: "abort-requested" }
+  /**
+   * **interview を経由しない経路** (skip / preset 流用後の rubric-confirm 等)
+   * のときに dispatch される。interview 経路では interview-start-requested が
+   * seedMode=false 遷移を担う (T019 plan §S7 役割再定義)。
+   */
   | { type: "seed-generate"; seed: string }
   | { type: "exit-seed-mode" }
   | { type: "retry-last" }
-  | { type: "set-seed-mode"; mode: "seed" | "chat" };
+  | { type: "set-seed-mode"; mode: "seed" | "chat" }
+  // T019 — interview / rubric / preset 経路
+  | { type: "interview-start-requested"; seed: string }
+  | {
+      type: "interview-question-received";
+      turnIndex: number;
+      question: string;
+      askedCount: number;
+      maxQuestions: number;
+    }
+  | { type: "interview-answer-submitted"; answer: string }
+  | { type: "interview-finished"; rubric: DeckRubric }
+  | { type: "interview-cancelled" }
+  | { type: "interview-error"; message: string }
+  | { type: "rubric-edit-changed"; rubric: DeckRubric }
+  | { type: "preset-list-received"; presets: RubricPreset[] }
+  | { type: "preset-use-requested"; presetId: string };
 
 const SEED_GENERATE_USER_TEXT = "[ドキュメントからスライドを生成]";
 
@@ -120,6 +181,8 @@ export function initialState(seedMode: boolean | null = null): ChatLogState {
     seedMode,
     messageRoles: {},
     seedDocument: null,
+    interview: null,
+    presets: [],
   };
 }
 
@@ -134,6 +197,8 @@ export function reduce(state: ChatLogState, action: Action): ChatLogState {
         seedMode: false,
         lastUserInput: action.seed,
         seedDocument: action.seed,
+        // skip / preset 流用経路では interview を畳む
+        interview: null,
       };
     }
     case "exit-seed-mode":
@@ -151,6 +216,101 @@ export function reduce(state: ChatLogState, action: Action): ChatLogState {
       return decidePermission(state, action.permissionId, action.allow);
     case "chat-event":
       return handleChatEvent(state, action.event);
+    case "interview-start-requested":
+      // interview 経路は seedMode=false に遷移し、UI を interview pane に切り替える.
+      // turn は触らない (interview は chat の turn machine と独立した別フェーズ).
+      return {
+        ...state,
+        seedMode: false,
+        seedDocument: action.seed,
+        interview: {
+          phase: "asking",
+          seed: action.seed,
+          pendingQuestion: null,
+          log: [],
+          draftRubric: null,
+          error: null,
+        },
+      };
+    case "interview-question-received": {
+      if (!state.interview) return state;
+      return {
+        ...state,
+        interview: {
+          ...state.interview,
+          phase: "asking",
+          pendingQuestion: {
+            turnIndex: action.turnIndex,
+            question: action.question,
+            askedCount: action.askedCount,
+            maxQuestions: action.maxQuestions,
+          },
+          error: null,
+        },
+      };
+    }
+    case "interview-answer-submitted": {
+      if (!state.interview || !state.interview.pendingQuestion) return state;
+      const q = state.interview.pendingQuestion;
+      return {
+        ...state,
+        interview: {
+          ...state.interview,
+          log: [...state.interview.log, { q: q.question, a: action.answer }],
+          // pendingQuestion は次の question 受信または finished で上書きされる
+          pendingQuestion: null,
+        },
+      };
+    }
+    case "interview-finished": {
+      if (!state.interview) {
+        // interview を経由していないが done だけ届いたら rubric-edit に直接入る
+        return {
+          ...state,
+          interview: {
+            phase: "rubric-edit",
+            seed: state.seedDocument ?? "",
+            pendingQuestion: null,
+            log: [],
+            draftRubric: action.rubric,
+            error: null,
+          },
+        };
+      }
+      return {
+        ...state,
+        interview: {
+          ...state.interview,
+          phase: "rubric-edit",
+          pendingQuestion: null,
+          draftRubric: action.rubric,
+          error: null,
+        },
+      };
+    }
+    case "interview-cancelled":
+      // interview を畳んで seed mode に戻す
+      return { ...state, interview: null, seedMode: true };
+    case "interview-error": {
+      if (!state.interview) return state;
+      return {
+        ...state,
+        interview: { ...state.interview, error: action.message },
+      };
+    }
+    case "rubric-edit-changed": {
+      if (!state.interview) return state;
+      return {
+        ...state,
+        interview: { ...state.interview, draftRubric: action.rubric },
+      };
+    }
+    case "preset-list-received":
+      return { ...state, presets: action.presets };
+    case "preset-use-requested":
+      // preset 流用は interview を介さないので、interview state を畳む.
+      // seed mode から外れる (rubric-confirm を追って bun が generate に遷移させる).
+      return { ...state, interview: null };
     default: {
       const _exhaustive: never = action;
       return _exhaustive;

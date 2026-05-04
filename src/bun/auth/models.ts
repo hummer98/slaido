@@ -10,3 +10,14 @@ export const VALIDATION_MODEL = {
   providerID: "openrouter",
   modelID: "anthropic/claude-haiku-4.5",
 } as const;
+
+/**
+ * interview ステップ用の軽量モデル ID 定数 (T019 plan §2.4).
+ *
+ * VALIDATION_MODEL と同一値だが、将来 interview だけ Sonnet 等に切り替えできるよう
+ * 別名で持つ (D2: 軽量モデル切替の責務はここに集約)。
+ */
+export const INTERVIEW_MODEL = {
+  providerID: "openrouter",
+  modelID: "anthropic/claude-haiku-4.5",
+} as const;
