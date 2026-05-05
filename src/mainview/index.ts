@@ -33,6 +33,7 @@ import {
   type MessageNode,
   type PermissionPrompt,
 } from "./state";
+import { renderMarkdown } from "./markdown";
 
 type ApiKeyErrorReason =
   | "unauthorized"
@@ -196,7 +197,7 @@ function renderSeedDisplay(): void {
     return;
   }
   seedDisplay.classList.remove("empty");
-  seedDisplay.textContent = seed;
+  seedDisplay.innerHTML = renderMarkdown(seed);
 }
 
 type TabName = "chat" | "seed";
@@ -365,7 +366,7 @@ function renderMessageNode(el: HTMLElement, msg: MessageNode): void {
         blockEl = replacement;
       }
       blockEl.className = "block-text";
-      blockEl.textContent = block.text;
+      blockEl.innerHTML = renderMarkdown(block.text);
     } else if (block.kind === "reasoning") {
       if (blockEl.tagName !== "DETAILS") {
         const replacement = document.createElement("details");
@@ -388,7 +389,7 @@ function renderMessageNode(el: HTMLElement, msg: MessageNode): void {
         textEl.className = "reasoning-text";
         blockEl.appendChild(textEl);
       }
-      textEl.textContent = block.text;
+      textEl.innerHTML = renderMarkdown(block.text);
     } else {
       if (blockEl.tagName !== "DIV") {
         const replacement = document.createElement("div");
