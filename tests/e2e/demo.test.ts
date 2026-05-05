@@ -200,13 +200,16 @@ test("DEMO.md 全工程: seed → generate → refine → export-zip → export-
   );
   expect(modalHidden).toBe(true);
 
-  // body の data-seed-mode が "loading" → "seed" に遷移するのを待つ
-  await mot.waitForSelector(`body[data-seed-mode="seed"]`, { timeout: 30_000 });
+  // body の data-phase が "loading" → "seed" に遷移するのを待つ
+  await mot.waitForSelector(`body[data-phase="seed"]`, { timeout: 30_000 });
 
   // ---- step 2: seed 投入 → generate ----
+  // T019 で #generate-btn は interview 経路に変わったため、
+  // 旧 flow を直接検証する e2e は #generate-skip-link を使う。
+  // interview flow 自体の e2e は別途追加する想定。
   const seed = await readFile(join(REPO_ROOT, "examples", "seed-meta.md"), "utf8");
   await mot.fill("#seed-input", seed);
-  await mot.click("#generate-btn");
+  await mot.click("#generate-skip-link");
 
   try {
     await mot.waitForSelector("#chat-messages .message.assistant", {
@@ -220,8 +223,8 @@ test("DEMO.md 全工程: seed → generate → refine → export-zip → export-
   }
 
   // ---- step 3: スライドが描画されていること ----
-  // generate 後は body[data-seed-mode="chat"] へ遷移している
-  await mot.waitForSelector(`body[data-seed-mode="chat"]`, { timeout: 10_000 });
+  // generate 後は body[data-phase="chat"] へ遷移している
+  await mot.waitForSelector(`body[data-phase="chat"]`, { timeout: 10_000 });
 
   // iframe contentDocument は cross-origin (views:// vs file://) で読めないので、
   // disk 上の slides/index.html を直接読んで <section> 数を確認する。
@@ -329,6 +332,34 @@ test("DEMO.md 全工程: seed → generate → refine → export-zip → export-
   expect(probe.presentSectionRect.y).toBeLessThan(probe.iframeRect.h);
 
   // ---- step 4: チャットで部分修正 ----
+  // slides ファイル生成完了 ≠ bridge.sendMessage 完了 のため、
+  // refine を送る前に opencode log の slaido_generate_end 出現を待つ。
+  // 待たないと generate が refine に supersede され generate_end が emit されない。
+  {
+    const opencodeLogDir = join(homedir(), ".local", "share", "opencode", "log");
+    const generateEndDeadline = Date.now() + ASSERT_TIMEOUT_MS;
+    let generateEnded = false;
+    while (Date.now() < generateEndDeadline) {
+      const logFiles = readdirSync(opencodeLogDir)
+        .filter((f) => f.endsWith(".log"))
+        .map((f) => {
+          const p = join(opencodeLogDir, f);
+          return { path: p, mtimeMs: statSync(p).mtimeMs };
+        })
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      const latest = logFiles[0]?.path;
+      if (latest) {
+        const content = await readFile(latest, "utf8");
+        if (content.includes("slaido_generate_end")) {
+          generateEnded = true;
+          break;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(generateEnded, "expected slaido_generate_end before refine").toBe(true);
+  }
+
   const refineMsg = "タイトルスライドのサブタイトルを『Mac App Store ready』に変えて";
   await mot.fill("#chat-input", refineMsg);
   await mot.click("#send-btn");
@@ -421,19 +452,33 @@ test("DEMO.md 全工程: seed → generate → refine → export-zip → export-
     "slaido_export_pdf_start",
     "slaido_export_pdf_end",
   ];
+  // waitForFile (PDF) は file 出現で戻るが log emit はその直後で
+  // 検証時にまだ書き込まれていないことがある。最大 120s poll する。
+  // (PDF export は Chrome cleanup を含めて await runPdf 完了が遅れるケースあり)
+  let polledLines = slaidoLines;
+  const eventDeadline = Date.now() + 120_000;
+  while (Date.now() < eventDeadline) {
+    const allFound = requiredEvents.every((ev) =>
+      polledLines.some((line) => line.includes(ev)),
+    );
+    if (allFound) break;
+    await new Promise((r) => setTimeout(r, 500));
+    const refreshed = await readFile(latestLogPath, "utf8");
+    polledLines = refreshed.split("\n").filter((line) => line.includes("service=slaido"));
+  }
   for (const ev of requiredEvents) {
-    const found = slaidoLines.some((line) => line.includes(ev));
+    const found = polledLines.some((line) => line.includes(ev));
     if (!found) {
       console.error(`[e2e missing event] ${ev} in ${latestLogPath}`);
       console.error("--- slaido lines ---");
-      console.error(slaidoLines.join("\n"));
+      console.error(polledLines.join("\n"));
     }
     expect(found, `expected ${ev} in ${latestLogPath}`).toBe(true);
   }
 
   // baseExtra (slaidoVersion) と perEventExtra (projectId) が flat key=value で並ぶこと.
-  expect(slaidoLines.some((line) => /\bslaidoVersion=/.test(line))).toBe(true);
-  const projectIdLines = slaidoLines.filter((line) => /\bprojectId=/.test(line));
+  expect(polledLines.some((line) => /\bslaidoVersion=/.test(line))).toBe(true);
+  const projectIdLines = polledLines.filter((line) => /\bprojectId=/.test(line));
   // 完了条件: 同一 projectId の行が 5 件以上 (1 セッション横断 grep が成り立つこと).
   expect(projectIdLines.length).toBeGreaterThanOrEqual(5);
 
