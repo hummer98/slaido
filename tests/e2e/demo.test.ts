@@ -186,6 +186,19 @@ afterAll(async () => {
 
   // エクスポート tempdir 掃除
   rmSync(EXPORT_DIR, { recursive: true, force: true });
+
+  // T021 defense-in-depth: defaultSpawn の kill が抜けても zombie Chrome を残さない.
+  // パターンは "--print-to-pdf" を必須にして通常の Chrome ブラウザを巻き込まない.
+  try {
+    const pkill = spawn({
+      cmd: ["pkill", "-f", "--print-to-pdf"],
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await Promise.race([pkill.exited, new Promise((r) => setTimeout(r, 2000))]);
+  } catch {
+    // pkill が無い環境でも fail しない
+  }
 });
 
 // LLM 生成 + 修正 + エクスポート x2 で長くなる。余裕を持たせる。

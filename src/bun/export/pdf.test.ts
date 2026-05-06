@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { ChromiumNotFoundError, PdfPrintError } from "./errors";
-import { buildChromiumArgs, exportPdf } from "./pdf";
+import { _makeDefaultSpawn, buildChromiumArgs, exportPdf } from "./pdf";
 
 const SLIDES_FIXTURE = join(
   import.meta.dir,
@@ -197,6 +197,214 @@ describe("exportPdf", () => {
       ),
     ).rejects.toBeInstanceOf(ChromiumNotFoundError);
   });
+
+  // ---- T021 Cycle 1: opts に outputPath / killAfterMs が渡る ----
+  it("passes outputPath and killAfterMs (default 60_000) to spawn opts (T021 cycle 1)", async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "slaido-userdata-"));
+    cleanupDirs.push(userDataDir);
+    const outDir = await mkdtemp(join(tmpdir(), "slaido-pdfout-"));
+    cleanupDirs.push(outDir);
+    const outputPath = join(outDir, "out.pdf");
+
+    let capturedOpts: SpawnOpts | null = null;
+    const fakeSpawn: FakeSpawn = async (cmd, opts) => {
+      capturedOpts = opts;
+      const flag = cmd.find((s) => s.startsWith("--print-to-pdf="));
+      if (flag) await writeFile(flag.slice("--print-to-pdf=".length), "%PDF-1.4\nfake\n", "binary");
+      return { exitCode: 0, stderr: "" };
+    };
+
+    await exportPdf(
+      {
+        slidesEntry: SLIDES_FIXTURE,
+        outputPath,
+        chromiumPath: "/path/to/chrome",
+        userDataDir,
+      },
+      { spawn: fakeSpawn },
+    );
+
+    expect(capturedOpts).not.toBeNull();
+    expect(capturedOpts!.outputPath).toBe(outputPath);
+    expect(capturedOpts!.killAfterMs).toBe(60_000);
+  });
+
+  it("forwards explicit timeoutMs as killAfterMs (T021 cycle 1)", async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "slaido-userdata-"));
+    cleanupDirs.push(userDataDir);
+    const outDir = await mkdtemp(join(tmpdir(), "slaido-pdfout-"));
+    cleanupDirs.push(outDir);
+    const outputPath = join(outDir, "out.pdf");
+
+    let capturedOpts: SpawnOpts | null = null;
+    const fakeSpawn: FakeSpawn = async (cmd, opts) => {
+      capturedOpts = opts;
+      const flag = cmd.find((s) => s.startsWith("--print-to-pdf="));
+      if (flag) await writeFile(flag.slice("--print-to-pdf=".length), "%PDF-1.4\nfake\n", "binary");
+      return { exitCode: 0, stderr: "" };
+    };
+
+    await exportPdf(
+      {
+        slidesEntry: SLIDES_FIXTURE,
+        outputPath,
+        chromiumPath: "/path/to/chrome",
+        userDataDir,
+        timeoutMs: 12_345,
+      },
+      { spawn: fakeSpawn },
+    );
+
+    expect(capturedOpts).not.toBeNull();
+    expect(capturedOpts!.killAfterMs).toBe(12_345);
+  });
+
+  // ---- T021 Cycle 4: killedByUs=true は非ゼロ exit code を許容 ----
+  it("tolerates non-zero exit code when spawn reports killedByUs=true (T021 cycle 4)", async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "slaido-userdata-"));
+    cleanupDirs.push(userDataDir);
+    const outDir = await mkdtemp(join(tmpdir(), "slaido-pdfout-"));
+    cleanupDirs.push(outDir);
+    const outputPath = join(outDir, "out.pdf");
+
+    const fakeSpawn: FakeSpawn = async (cmd) => {
+      const flag = cmd.find((s) => s.startsWith("--print-to-pdf="));
+      if (flag) await writeFile(flag.slice("--print-to-pdf=".length), "%PDF-1.4\nfake\n", "binary");
+      // SIGTERM 由来 exit code 143 を返す (kill された)
+      return { exitCode: 143, stderr: "", killedByUs: true };
+    };
+
+    // killedByUs=true なので exit code 143 でも throw しない
+    await exportPdf(
+      {
+        slidesEntry: SLIDES_FIXTURE,
+        outputPath,
+        chromiumPath: "/path/to/chrome",
+        userDataDir,
+      },
+      { spawn: fakeSpawn },
+    );
+
+    expect(await Bun.file(outputPath).exists()).toBe(true);
+  });
+});
+
+// ---- T021 Cycle 2 / Cycle 3: defaultSpawn 内部の kill / timeout 動作 ----
+describe("_makeDefaultSpawn (T021 inner spawn behavior)", () => {
+  let cleanupDirs: string[] = [];
+  afterEach(async () => {
+    for (const dir of cleanupDirs) {
+      await rm(dir, { recursive: true, force: true });
+    }
+    cleanupDirs = [];
+  });
+
+  /**
+   * Bun.Subprocess を最小限 mock する. stdout/stderr の controller を保持し
+   * kill() で stream を close → exited を resolve させる.
+   */
+  function makeMockProc() {
+    let stdoutCtrl!: ReadableStreamDefaultController<Uint8Array>;
+    let stderrCtrl!: ReadableStreamDefaultController<Uint8Array>;
+    let exitedResolve!: (n: number) => void;
+    const stdout = new ReadableStream<Uint8Array>({
+      start(c) {
+        stdoutCtrl = c;
+      },
+    });
+    const stderr = new ReadableStream<Uint8Array>({
+      start(c) {
+        stderrCtrl = c;
+      },
+    });
+    const exited = new Promise<number>((res) => {
+      exitedResolve = res;
+    });
+    const killCalls: number[] = [];
+    let closed = false;
+    const closeStreams = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        stdoutCtrl.close();
+      } catch {}
+      try {
+        stderrCtrl.close();
+      } catch {}
+    };
+    const proc = {
+      stdout,
+      stderr,
+      exited,
+      kill(signal?: number) {
+        killCalls.push(signal ?? -1);
+        // SIGTERM/SIGKILL いずれでも 10ms 後に exit する mock 動作
+        closeStreams();
+        const code = signal === 9 ? 137 : 143;
+        setTimeout(() => exitedResolve(code), 10);
+      },
+    };
+    return { proc, killCalls };
+  }
+
+  // Cycle 2: PDF 出現 → 500ms grace 後 SIGTERM
+  it("kills the proc with SIGTERM after PDF appears (with grace)", async () => {
+    const outDir = await mkdtemp(join(tmpdir(), "slaido-pdfspawn-"));
+    cleanupDirs.push(outDir);
+    const outputPath = join(outDir, "out.pdf");
+
+    const { proc, killCalls } = makeMockProc();
+    const fakeSpawnImpl = ((_cmd: string[], _opts: unknown) => proc) as unknown as Parameters<
+      typeof _makeDefaultSpawn
+    >[0];
+    const innerSpawn = _makeDefaultSpawn(fakeSpawnImpl);
+
+    // Spawn が始まってから 300ms 後に PDF を書く. polling (200ms) で検知 → 500ms grace → kill
+    setTimeout(() => {
+      void writeFile(outputPath, "%PDF-1.4\nfake\n", "binary").catch(() => {});
+    }, 300);
+
+    const start = Date.now();
+    const result = await innerSpawn(["/fake/chrome", `--print-to-pdf=${outputPath}`], {
+      outputPath,
+      killAfterMs: 10_000,
+    });
+    const elapsed = Date.now() - start;
+
+    expect(killCalls.length).toBeGreaterThan(0);
+    expect(killCalls[0]).toBe(15); // SIGTERM
+    expect(result.killedByUs).toBe(true);
+    // grace を尊重: PDF 書き込み (300ms) + grace (500ms) = 800ms 以上, killAfterMs より十分早い
+    expect(elapsed).toBeGreaterThanOrEqual(700);
+    expect(elapsed).toBeLessThan(5_000);
+  }, 15_000);
+
+  // Cycle 3: 絶対 timeout で SIGKILL → PdfPrintError throw
+  it("throws PdfPrintError with SIGKILL when chrome does not exit within killAfterMs", async () => {
+    const outDir = await mkdtemp(join(tmpdir(), "slaido-pdfspawn-"));
+    cleanupDirs.push(outDir);
+    // outputPath は存在しない (PDF を書かない) ので polling は発火しない
+    const outputPath = join(outDir, "out.pdf");
+
+    const { proc, killCalls } = makeMockProc();
+    const fakeSpawnImpl = ((_cmd: string[], _opts: unknown) => proc) as unknown as Parameters<
+      typeof _makeDefaultSpawn
+    >[0];
+    const innerSpawn = _makeDefaultSpawn(fakeSpawnImpl);
+
+    let thrown: unknown = null;
+    try {
+      await innerSpawn(["/fake/chrome", `--print-to-pdf=${outputPath}`], {
+        outputPath,
+        killAfterMs: 200,
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(PdfPrintError);
+    expect((thrown as Error).message).toMatch(/did not exit|timeout/i);
+    expect(killCalls).toContain(9); // SIGKILL
+  }, 5_000);
 });
 
 // env wrapper add-on test (plan §6.3 / §7.1 cycle 5 add-on)
@@ -255,8 +463,13 @@ describe("exportPdf via SLAIDO_CHROME_PATH env wrapper script", () => {
   });
 });
 
-// fakeSpawn の型. PdfDeps.spawn と同じ shape.
+// fakeSpawn の opts/return shape. PdfDeps.spawn と同じ.
+type SpawnOpts = {
+  signal?: AbortSignal;
+  outputPath?: string;
+  killAfterMs?: number;
+};
 type FakeSpawn = (
   cmd: string[],
-  opts: { signal?: AbortSignal },
-) => Promise<{ exitCode: number; stderr: string }>;
+  opts: SpawnOpts,
+) => Promise<{ exitCode: number; stderr: string; killedByUs?: boolean }>;
