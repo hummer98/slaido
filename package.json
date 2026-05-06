@@ -1,6 +1,6 @@
 {
   "name": "slaido",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AI-driven slide generator powered by Electrobun and reveal.js",
   "license": "MIT",
   "author": "Yuji Yamamoto",
